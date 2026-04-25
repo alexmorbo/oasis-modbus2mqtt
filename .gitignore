@@ -1,0 +1,23 @@
+# Build artifacts
+bin/
+# Stray binary from `go build ./...` (default output for ./cmd/server)
+/server
+
+# Test & coverage output
+coverage.*
+*.test
+*.out
+
+# Vendor (we don't vendor, but guard anyway)
+vendor/
+
+# Local env / secrets
+.env
+*.local
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
