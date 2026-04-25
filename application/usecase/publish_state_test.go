@@ -137,7 +137,7 @@ func TestApply_PublishesAllOnFirstCall(t *testing.T) {
 	require.NoError(t, err)
 
 	calls := pub.snapshot()
-	assert.Len(t, calls, 18)
+	assert.Len(t, calls, 19)
 	for _, c := range calls {
 		assert.False(t, c.retained, "state messages must be non-retained, got %s", c.topic)
 	}
@@ -187,7 +187,7 @@ func TestApply_DeltaSkipsUnchanged(t *testing.T) {
 
 	require.NoError(t, ps.Apply(context.Background(), snap))
 	first := len(pub.snapshot())
-	assert.Equal(t, 18, first)
+	assert.Equal(t, 19, first)
 
 	pub.reset()
 	require.NoError(t, ps.Apply(context.Background(), snap))
@@ -455,7 +455,7 @@ func TestApply_ZeroSnapshot_PublishesDefaults(t *testing.T) {
 
 	require.NoError(t, ps.Apply(context.Background(), entity.Snapshot{}))
 	calls := pub.snapshot()
-	assert.Len(t, calls, 18)
+	assert.Len(t, calls, 19)
 
 	c, ok := pub.findCall("test/state/firmware")
 	require.True(t, ok)
@@ -495,5 +495,5 @@ func TestApply_LogsPublishedCount(t *testing.T) {
 	require.NoError(t, ps.Apply(context.Background(), sampleSnapshot(t)))
 	out := buf.String()
 	assert.Contains(t, out, "state published")
-	assert.Contains(t, out, `"count":18`)
+	assert.Contains(t, out, `"count":19`)
 }

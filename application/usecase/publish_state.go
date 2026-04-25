@@ -163,6 +163,11 @@ func (p *PublishState) buildMessages(snap entity.Snapshot) []stateMsg {
 			objectID: "operation_time_left",
 		},
 		{
+			topic:    p.topics.State("current_operation"),
+			payload:  []byte(snap.Operation.String()),
+			objectID: "current_operation",
+		},
+		{
 			topic:    p.topics.State("power"),
 			payload:  []byte(boolToOnOff(snap.PowerOn)),
 			objectID: "power",
@@ -253,8 +258,13 @@ func hvacAction(snap entity.Snapshot) string {
 	switch snap.Operation {
 	case entity.OpPreheatCalorifier:
 		return "preheating"
-	case entity.OpStartFan, entity.OpFanCoastdown:
+	case entity.OpStartFan, entity.OpFanCoastdown, entity.OpRotorSpinup:
 		return "fan"
+	case entity.OpCloseDamper, entity.OpElectricCalorifierPurge,
+		entity.OpOpenDamper, entity.OpNorthStart,
+		entity.OpOpenHotWaterValve, entity.OpCloseHotWaterValve,
+		entity.OpOpenColdValve, entity.OpCloseColdValve:
+		return "idle"
 	}
 	if snap.HeaterPWM {
 		return "heating"

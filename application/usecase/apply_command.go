@@ -129,19 +129,21 @@ func (a *ApplyCommand) Apply(ctx context.Context, cmd dto.Command) error {
 }
 
 // setPower writes the Power_Dev (h2) edge sequence. ON is a single rising
-// write and bypasses the transition guard so a stuck controller can be
-// recovered. OFF is a rising-then-falling sequence with a context-aware dwell
-// in between and respects the transition guard.
+// write; OFF is a rising-then-falling sequence with a context-aware dwell
+// in between. Both paths respect the transition guard — the controller's
+// shutdown phases (close_damper, electric_calorifier_purge) take 30-60s
+// and ignore writes during that window, so we reject early instead of
+// silently dropping the user's command.
 func (a *ApplyCommand) setPower(ctx context.Context, cmd dto.SetPowerCommand) error {
+	if err := a.transitionGuard(); err != nil {
+		return err
+	}
+
 	if cmd.On {
 		if err := a.dispatcher.WriteHolding(ctx, AddrPowerDev, 1); err != nil {
 			return fmt.Errorf("power on write h%d: %w", AddrPowerDev, err)
 		}
 		return nil
-	}
-
-	if err := a.transitionGuard(); err != nil {
-		return err
 	}
 
 	if err := a.dispatcher.WriteHolding(ctx, AddrPowerDev, 1); err != nil {

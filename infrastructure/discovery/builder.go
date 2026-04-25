@@ -20,6 +20,10 @@ const (
 	BinarySensorDamperOpen = "damper_open"
 	// BinarySensorProblem is the object id of the derived problem binary_sensor.
 	BinarySensorProblem = "problem"
+	// SensorCurrentOperation is the object id of the derived current_operation
+	// sensor (text label of OperatingState — close_damper / preheat_calorifier
+	// / electric_calorifier_purge / etc.).
+	SensorCurrentOperation = "current_operation"
 	// ClimateObjectID is the object id of the composite climate entity.
 	ClimateObjectID = "climate"
 )
@@ -108,7 +112,26 @@ func (b *Builder) Build(firmware string) ([]Discovery, error) {
 	}
 	out = append(out, problem)
 
+	currentOp, err := b.buildDerivedSensor(SensorCurrentOperation, "Current operation",
+		catalog.EntityCategoryDiagnostic, "mdi:cog-sync", firmware)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, currentOp)
+
 	return out, nil
+}
+
+func (b *Builder) buildDerivedSensor(
+	objectID, name string,
+	category catalog.EntityCategory, icon, firmware string,
+) (Discovery, error) {
+	hint := catalog.EntityHint{Category: category, Icon: icon}
+	payload := SensorPayload{
+		baseEntity: b.baseFor(objectID, name, hint, firmware),
+		StateTopic: b.topics.State(objectID),
+	}
+	return b.marshal("sensor", objectID, payload)
 }
 
 func (b *Builder) deviceInfo(firmware string) DeviceInfo {

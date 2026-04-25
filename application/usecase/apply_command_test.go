@@ -180,14 +180,16 @@ func TestApply_SetPower_Off_TransitionGuard_Refuses(t *testing.T) {
 	assert.Empty(t, d.snapshotWrites())
 }
 
-func TestApply_SetPower_On_AllowedDuringTransition(t *testing.T) {
+func TestApply_SetPower_On_BlockedDuringTransition(t *testing.T) {
 	t.Parallel()
 	d := &fakeCommandDispatcher{}
 	apply := usecase.NewApplyCommand(d, newSnaps(entity.OpPreheatCalorifier), discardLogger())
 
 	err := apply.Apply(context.Background(), dto.SetPowerCommand{On: true})
-	require.NoError(t, err)
-	assert.Equal(t, []writeCall{{addr: 2, value: 1}}, d.snapshotWrites())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, dto.ErrTransitionInProgress)
+	assert.Empty(t, d.snapshotWrites(),
+		"SetPower(on=true) must respect transition guard — controller ignores writes during shutdown phases")
 }
 
 func TestApply_SetPower_Off_FirstWriteFails_NoSecondWrite(t *testing.T) {
