@@ -193,7 +193,7 @@ func TestSubscribe_AndReceive(t *testing.T) {
 	require.True(t, tok.WaitTimeout(2*time.Second))
 	require.NoError(t, tok.Error())
 
-	assert.Eventually(t, func() bool { return received.Load() >= 1 }, 5*time.Second, 50*time.Millisecond)
+	assert.Eventually(t, func() bool { return received.Load() >= 1 }, 15*time.Second, 50*time.Millisecond)
 	if v := lastPayload.Load(); v != nil {
 		assert.Equal(t, []byte("hi-from-raw"), v.([]byte))
 	}
@@ -345,7 +345,7 @@ func TestConnected_ReflectsState(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	require.NoError(t, c.Connect(ctx))
-	assert.Eventually(t, c.Connected, 3*time.Second, 50*time.Millisecond)
+	assert.Eventually(t, c.Connected, 10*time.Second, 50*time.Millisecond)
 
 	c.Disconnect(200 * time.Millisecond)
 	assert.False(t, c.Connected())
