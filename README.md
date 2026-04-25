@@ -8,6 +8,18 @@ A Go service that bridges a **GTC Oasis Syberia v5** HVAC controller (Modbus TCP
 
 Replaces Home Assistant's native `modbus:` YAML integration with a self-healing service that handles the controller's quirks (single-TCP-connection, edge-triggered Power register, RMW for mode bits, transition states) so the rest of HA doesn't have to.
 
+## Screenshots
+
+| Home Assistant overview | Climate control | Diagnostics |
+|---|---|---|
+| ![HA overview](static/ha-overview.png) | ![HA climate](static/ha-climate.png) | ![HA diagnostic](static/ha-diagnostic.png) |
+
+Grafana dashboard (one device → all bridge metrics on one screen):
+
+![Grafana dashboard](static/grafana.png)
+
+The Grafana dashboard JSON ships in [`grafana/oasis.json`](grafana/oasis.json) — drop it into Grafana via *Dashboards → New → Import*, or apply it via grafana-operator / Terraform `grafana_dashboard` resource. It assumes a Prometheus-compatible datasource named `vm` and the bridge metrics on `oasis_*` (the default).
+
 ## Status
 
 Running in production on the author's homelab against a real GTC Oasis Syberia 5 (firmware v5.2.0). Treat as **0.x — API may evolve**. Hardware-specific decoding is reverse-engineered; PRs welcome for other Oasis variants.
