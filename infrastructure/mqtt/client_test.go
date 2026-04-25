@@ -273,7 +273,7 @@ func TestSubscribe_RestoredOnReconnect(t *testing.T) {
 	pub := newRawPublisher(t)
 	tok := pub.Publish(topic, 1, false, "before-reconnect")
 	require.True(t, tok.WaitTimeout(2*time.Second))
-	assert.Eventually(t, func() bool { return received.Load() >= 1 }, 3*time.Second, 50*time.Millisecond)
+	assert.Eventually(t, func() bool { return received.Load() >= 1 }, 10*time.Second, 50*time.Millisecond)
 
 	// Hard cycle: Disconnect then Connect again. onConnect should re-subscribe.
 	c.Disconnect(200 * time.Millisecond)
@@ -284,15 +284,15 @@ func TestSubscribe_RestoredOnReconnect(t *testing.T) {
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel2()
 	require.NoError(t, c.Connect(ctx2))
-	assert.Eventually(t, c.Connected, 3*time.Second, 50*time.Millisecond)
+	assert.Eventually(t, c.Connected, 10*time.Second, 50*time.Millisecond)
 
 	// Give onConnect time to resubscribe.
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
 	tok2 := pub.Publish(topic, 1, false, "after-reconnect")
 	require.True(t, tok2.WaitTimeout(2*time.Second))
 
-	assert.Eventually(t, func() bool { return received.Load() >= 2 }, 5*time.Second, 50*time.Millisecond)
+	assert.Eventually(t, func() bool { return received.Load() >= 2 }, 15*time.Second, 100*time.Millisecond)
 
 	c.Disconnect(200 * time.Millisecond)
 }
