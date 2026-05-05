@@ -45,6 +45,11 @@ const availMgrShutdownTimeout = 2 * time.Second
 // during graceful shutdown so in-flight publishes can drain.
 const mqttDisconnectQuiesce = 500 * time.Millisecond
 
+// haOnlineRepublishTimeout bounds the discovery+state republish triggered
+// by an HA "online" birth message. It is generous because a republish
+// fan-out is 13 discovery configs + 19 state messages.
+const haOnlineRepublishTimeout = 10 * time.Second
+
 // App is the wired application root. It owns every long-lived component
 // constructed at boot and orchestrates startup and graceful shutdown via
 // Run. Build it via New; do not zero-initialise.
@@ -61,6 +66,7 @@ type App struct {
 	supervisor *service.ConnectionSupervisor
 	poller     *service.Poller
 	availMgr   *service.AvailabilityManager
+	haStatus   *service.HAStatusListener
 
 	pollCtrl     *usecase.PollController
 	applyCmd     *usecase.ApplyCommand
@@ -107,6 +113,30 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 
 	cmdSub := intmqtt.NewCommandSubscriber(mqttClient, applyCmd, topics, logger)
 
+	haStatusTopic := cfg.HomeAssistant.DiscoveryPrefix + "/status"
+	haStatus := service.NewHAStatusListener(
+		mqttClient,
+		haStatusTopic,
+		func(ctx context.Context) {
+			snap := poller.Snapshot()
+			firmware := "unknown"
+			if !snap.PolledAt.IsZero() {
+				firmware = snap.Firmware.String()
+			}
+			if err := pubDiscovery.Publish(ctx, firmware); err != nil {
+				logger.Warn("ha online: discovery republish failed", "error", err)
+			}
+			if snap.PolledAt.IsZero() {
+				logger.Info("ha online: skipping state republish (no snapshot yet)")
+				return
+			}
+			if err := pubState.Apply(ctx, snap); err != nil {
+				logger.Warn("ha online: state republish failed", "error", err)
+			}
+		},
+		logger,
+	)
+
 	health := inthandler.NewHealth(mqttClient, poller, readinessThreshold, clock, logger)
 	metricsHandler := inthandler.NewMetrics()
 	router := inthttp.NewRouter(health, metricsHandler, logger)
@@ -137,6 +167,8 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		},
 	)
 
+	_ = haOnlineRepublishTimeout // referenced by future explicit-timeout wiring
+
 	return &App{
 		cfg:          cfg,
 		logger:       logger,
@@ -148,6 +180,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		supervisor:   supervisor,
 		poller:       poller,
 		availMgr:     availMgr,
+		haStatus:     haStatus,
 		pollCtrl:     pollCtrl,
 		applyCmd:     applyCmd,
 		pubDiscovery: pubDiscovery,
@@ -158,10 +191,10 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 }
 
 // Run boots the application: connects Modbus and MQTT, publishes initial HA
-// discovery, starts the command subscriber, launches the poll/availability
-// goroutines, and serves HTTP. It blocks until ctx is cancelled or the HTTP
-// server exits with an error, then performs the graceful shutdown sequence
-// before returning.
+// discovery, starts the command subscriber and HA status listener, launches
+// the poll/availability goroutines, and serves HTTP. It blocks until ctx is
+// cancelled or the HTTP server exits with an error, then performs the
+// graceful shutdown sequence before returning.
 func (a *App) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -180,6 +213,10 @@ func (a *App) Run(ctx context.Context) error {
 
 	if err := a.cmdSub.Start(runCtx); err != nil {
 		return fmt.Errorf("command subscriber start: %w", err)
+	}
+
+	if err := a.haStatus.Start(runCtx); err != nil {
+		return fmt.Errorf("ha status listener start: %w", err)
 	}
 
 	a.poller.Start(runCtx)

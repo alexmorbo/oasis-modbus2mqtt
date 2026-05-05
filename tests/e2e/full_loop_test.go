@@ -152,3 +152,110 @@ func TestE2E_FullLoop(t *testing.T) {
 		return string(availabilityGetter()["oasis_test/availability"]) == "offline"
 	}, 5*time.Second, 100*time.Millisecond, "retained offline availability after shutdown")
 }
+
+// TestRetainedStateSurvivesSubscriberReconnect boots the wired application,
+// waits for the bridge to populate the broker with retained state, then
+// connects a *fresh* observer client (no shared session) and verifies that
+// stable values like firmware and hvac_mode arrive immediately from the
+// retained store — not after the next poll. This is the regression guard
+// for the 2026-04-30 incident where firmware/heater_active stuck in
+// "unknown" after an HA-side resubscribe.
+//
+//nolint:misspell // mosquitto is the broker's correct name
+func TestRetainedStateSurvivesSubscriberReconnect(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e test requires Docker; skipped under -short")
+	}
+	if raceEnabled {
+		t.Skip("e2e: skipping under -race due to known mbserver upstream data race on HoldingRegisters slice")
+	}
+
+	server, modbusAddr := startMbserver(t)
+	preset(server)
+
+	mqttBroker := startMosquitto(t)
+
+	modbusHost, modbusPort := splitAddr(t, modbusAddr)
+	cfg := &config.Config{
+		Modbus: config.ModbusConfig{
+			Host:           modbusHost,
+			Port:           modbusPort,
+			SlaveID:        1,
+			ConnectTimeout: 2 * time.Second,
+			ReadTimeout:    1 * time.Second,
+			WriteTimeout:   1 * time.Second,
+			GuardInterval:  20 * time.Millisecond,
+		},
+		MQTT: config.MQTTConfig{
+			Broker:    mqttBroker,
+			ClientID:  "oasis-e2e-bridge-" + uuid.NewString(),
+			Keepalive: 5 * time.Second,
+			QoS:       1,
+		},
+		HomeAssistant: config.HAConfig{
+			DiscoveryPrefix: "homeassistant",
+			DevicePrefix:    "oasis_test",
+			DeviceName:      "Oasis E2E",
+			Manufacturer:    "Syberia",
+			Model:           "TestModel",
+		},
+		Polling: config.PollingConfig{
+			HotInterval:           200 * time.Millisecond,
+			MediumInterval:        400 * time.Millisecond,
+			SlowInterval:          1 * time.Second,
+			AvailabilityThreshold: 2 * time.Second,
+		},
+		HTTP:   config.HTTPConfig{Port: 0},
+		Logger: config.LoggerConfig{Level: "warn"},
+		Reconnect: config.ReconnectConfig{
+			MinDelay:  1 * time.Millisecond,
+			MaxDelay:  10 * time.Millisecond,
+			Factor:    2.0,
+			JitterPct: 0,
+		},
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	a, err := app.New(cfg, logger)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	// Wait until at least one full slow-tier poll has happened, so the broker
+	// is guaranteed to hold retained values for every state topic.
+	primary := newTestPahoClient(t, mqttBroker, "test-primary-"+uuid.NewString())
+	primaryStates := subscribeAndCollect(t, primary, "oasis_test/state/+")
+
+	assert.Eventually(t, func() bool {
+		states := primaryStates()
+		return string(states["oasis_test/state/firmware"]) == "v5.2.0" &&
+			string(states["oasis_test/state/hvac_mode"]) == "heat"
+	}, 30*time.Second, 100*time.Millisecond, "primary client sees firmware and hvac_mode populated")
+
+	// Now connect a *fresh* subscriber that joins after the bridge has been
+	// running for a while. With retained=true on every state publish, the
+	// broker must replay the latest value immediately on subscribe — even
+	// for stable signals that have not changed since boot.
+	observer := newTestPahoClient(t, mqttBroker, "test-observer-late-"+uuid.NewString())
+	observerStates := subscribeAndCollect(t, observer, "oasis_test/state/+")
+
+	assert.Eventually(t, func() bool {
+		states := observerStates()
+		return string(states["oasis_test/state/firmware"]) == "v5.2.0" &&
+			string(states["oasis_test/state/hvac_mode"]) == "heat" &&
+			string(states["oasis_test/state/heater_active"]) != "" &&
+			string(states["oasis_test/state/damper_open"]) != "" &&
+			string(states["oasis_test/state/device_id"]) != ""
+	}, 5*time.Second, 50*time.Millisecond,
+		"late observer must receive retained state for stable entities")
+
+	cancel()
+	select {
+	case runErr := <-done:
+		require.NoError(t, runErr, "app.Run should return cleanly on ctx cancel")
+	case <-time.After(15 * time.Second):
+		t.Fatal("app.Run did not return within shutdown timeout")
+	}
+}

@@ -139,7 +139,7 @@ func TestApply_PublishesAllOnFirstCall(t *testing.T) {
 	calls := pub.snapshot()
 	assert.Len(t, calls, 19)
 	for _, c := range calls {
-		assert.False(t, c.retained, "state messages must be non-retained, got %s", c.topic)
+		assert.True(t, c.retained, "state messages must be retained, got non-retained for %s", c.topic)
 	}
 
 	c, ok := pub.findCall("test/state/supply_temperature")
@@ -179,61 +179,37 @@ func TestApply_PublishesAllOnFirstCall(t *testing.T) {
 	assert.Equal(t, []byte("OFF"), c.payload)
 }
 
-func TestApply_DeltaSkipsUnchanged(t *testing.T) {
+func TestApply_RepublishesAllOnEveryCall(t *testing.T) {
 	t.Parallel()
 	pub := &fakeStatePublisher{}
 	ps := usecase.NewPublishState(pub, fakeTopics{}, discardLoggerState())
 	snap := sampleSnapshot(t)
 
-	require.NoError(t, ps.Apply(context.Background(), snap))
-	first := len(pub.snapshot())
-	assert.Equal(t, 19, first)
-
-	pub.reset()
-	require.NoError(t, ps.Apply(context.Background(), snap))
-	assert.Empty(t, pub.snapshot(), "second Apply with identical snapshot must publish nothing")
-}
-
-func TestApply_DeltaPublishesChanged(t *testing.T) {
-	t.Parallel()
-	pub := &fakeStatePublisher{}
-	ps := usecase.NewPublishState(pub, fakeTopics{}, discardLoggerState())
-	snap := sampleSnapshot(t)
-
-	require.NoError(t, ps.Apply(context.Background(), snap))
-	pub.reset()
-
-	snap.FanTarget1 = 7
-	require.NoError(t, ps.Apply(context.Background(), snap))
+	for range 3 {
+		require.NoError(t, ps.Apply(context.Background(), snap))
+	}
 
 	calls := pub.snapshot()
-	require.Len(t, calls, 1)
-	assert.Equal(t, "test/state/fan_target", calls[0].topic)
-	assert.Equal(t, []byte("7"), calls[0].payload)
+	assert.Len(t, calls, 57, "three identical Apply calls must publish 19×3 messages")
+	for _, c := range calls {
+		assert.True(t, c.retained, "every state publish must be retained")
+	}
 }
 
-func TestApply_PublishError_DoesNotUpdateLastPayload(t *testing.T) {
+func TestApply_AlwaysRetainsState(t *testing.T) {
 	t.Parallel()
-	sentinel := errors.New("publish boom")
-	pub := &fakeStatePublisher{errByTop: map[string]error{"test/state/fan_target": sentinel}}
+	pub := &fakeStatePublisher{}
 	ps := usecase.NewPublishState(pub, fakeTopics{}, discardLoggerState())
-	snap := sampleSnapshot(t)
 
-	err := ps.Apply(context.Background(), snap)
-	require.Error(t, err)
-	assert.ErrorIs(t, err, sentinel)
-
+	require.NoError(t, ps.Apply(context.Background(), sampleSnapshot(t)))
 	pub.reset()
-	pub.mu.Lock()
-	pub.errByTop = nil
-	pub.mu.Unlock()
+	require.NoError(t, ps.Apply(context.Background(), sampleSnapshot(t)))
 
-	err = ps.Apply(context.Background(), snap)
-	require.NoError(t, err)
-	c, ok := pub.findCall("test/state/fan_target")
-	require.True(t, ok, "second Apply should retry the previously failed topic")
-	assert.Equal(t, []byte("5"), c.payload)
-	assert.Len(t, pub.snapshot(), 1, "only the previously failed topic should be retried")
+	calls := pub.snapshot()
+	require.Len(t, calls, 19)
+	for _, c := range calls {
+		assert.True(t, c.retained, "retained flag must be true on %s", c.topic)
+	}
 }
 
 func TestApply_AggregatesErrors(t *testing.T) {
@@ -250,6 +226,20 @@ func TestApply_AggregatesErrors(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errA)
 	assert.ErrorIs(t, err, errB)
+}
+
+func TestApply_ErrorOnOneTopic_DoesNotSkipOthers(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("publish boom")
+	pub := &fakeStatePublisher{errByTop: map[string]error{"test/state/fan_target": sentinel}}
+	ps := usecase.NewPublishState(pub, fakeTopics{}, discardLoggerState())
+
+	err := ps.Apply(context.Background(), sampleSnapshot(t))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, sentinel)
+
+	calls := pub.snapshot()
+	assert.Len(t, calls, 19, "all 19 publish attempts must be made even when one fails")
 }
 
 func TestHvacMode_PowerOff(t *testing.T) {

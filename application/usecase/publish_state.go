@@ -1,13 +1,11 @@
 package usecase
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
-	"sync"
 
 	"github.com/alexmorbo/oasis-modbus2mqtt/domain/entity"
 	"github.com/alexmorbo/oasis-modbus2mqtt/domain/valueobject"
@@ -31,20 +29,20 @@ type stateMsg struct {
 }
 
 // PublishState transforms a domain Snapshot into per-entity MQTT state messages
-// and publishes only the deltas relative to the last successful publish. A
-// single Apply call may emit zero, one, or many publishes depending on what
-// changed since the previous snapshot.
+// and publishes every message retained on every Apply. Idempotent publishes
+// are cheap and let any reconnecting subscriber recover the current value
+// from the broker instead of waiting for the next change. A single Apply call
+// emits all 19 messages; per-topic publish errors are aggregated via
+// errors.Join.
 type PublishState struct {
-	publisher   Publisher
-	topics      Topics
-	logger      *slog.Logger
-	mu          sync.Mutex
-	lastPayload map[string][]byte
+	publisher Publisher
+	topics    Topics
+	logger    *slog.Logger
 }
 
 // NewPublishState constructs a PublishState. A nil publisher or nil topics
 // builder is a programming error and panics. A nil logger falls back to
-// slog.Default. The internal delta cache is initialised empty.
+// slog.Default.
 func NewPublishState(pub Publisher, topics Topics, logger *slog.Logger) *PublishState {
 	if pub == nil {
 		panic("publish state: publisher must not be nil")
@@ -56,55 +54,42 @@ func NewPublishState(pub Publisher, topics Topics, logger *slog.Logger) *Publish
 		logger = slog.Default()
 	}
 	return &PublishState{
-		publisher:   pub,
-		topics:      topics,
-		logger:      logger,
-		lastPayload: make(map[string][]byte),
+		publisher: pub,
+		topics:    topics,
+		logger:    logger,
 	}
 }
 
-// Apply publishes every state message whose payload differs from the value
-// last successfully published on the same topic. Identical payloads are
-// silently skipped (DEBUG-logged). Publish errors are aggregated via
-// errors.Join; failed topics are NOT inserted into the cache, so the next
-// Apply will retry them. Messages are sent with retained=false because the
-// AvailabilityManager (story 008) drives offline transitions out-of-band.
+// Apply publishes every state message for snap with retained=true. All 19
+// messages are sent on every call — there is no payload-level dedup. The
+// retained flag means a late or reconnecting subscriber (HA restart, MQTT
+// integration reload, broker blip) recovers the current value from the
+// broker instead of staying at "unknown" until the underlying register
+// changes. Per-topic publish errors are aggregated via errors.Join; a single
+// failed publish does not skip the remaining topics.
 func (p *PublishState) Apply(ctx context.Context, snap entity.Snapshot) error {
 	msgs := p.buildMessages(snap)
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	var (
 		errs      []error
 		published int
-		skipped   int
 	)
 	for _, m := range msgs {
-		if prev, ok := p.lastPayload[m.topic]; ok && bytes.Equal(prev, m.payload) {
-			skipped++
-			p.logger.Debug("state skip: payload unchanged", "object_id", m.objectID, "topic", m.topic)
-			continue
-		}
-		if err := p.publisher.Publish(ctx, m.topic, m.payload, false); err != nil {
+		if err := p.publisher.Publish(ctx, m.topic, m.payload, true); err != nil {
 			errs = append(errs, fmt.Errorf("publish state %s: %w", m.objectID, err))
 			continue
 		}
-		p.lastPayload[m.topic] = append([]byte(nil), m.payload...)
 		published++
 	}
 
 	if len(errs) > 0 {
 		p.logger.Warn("state publish completed with errors",
 			"published", published,
-			"skipped", skipped,
 			"errors", len(errs),
 		)
 		return errors.Join(errs...)
 	}
-	if published > 0 {
-		p.logger.Info("state published", "count", published, "skipped", skipped)
-	}
+	p.logger.Info("state published", "count", published)
 	return nil
 }
 
@@ -154,7 +139,7 @@ func (p *PublishState) buildMessages(snap entity.Snapshot) []stateMsg {
 		},
 		{
 			topic:    p.topics.State("device_id"),
-			payload:  []byte(fmt.Sprintf("0x%04X", snap.DeviceID)),
+			payload:  fmt.Appendf(nil, "0x%04X", snap.DeviceID),
 			objectID: "device_id",
 		},
 		{
