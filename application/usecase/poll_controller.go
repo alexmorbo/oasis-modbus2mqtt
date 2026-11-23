@@ -151,8 +151,10 @@ func (p *PollController) PollMedium(ctx context.Context) (entity.Snapshot, error
 	return snap, nil
 }
 
-// PollSlow reads the slow-tier register set (i0, i79, h0) and returns a
-// Snapshot populated with the slow-tier fields.
+// PollSlow reads the slow-tier register set (i0, i79, h0, h344, h346) and
+// returns a Snapshot populated with the slow-tier fields. i0, i79 and h0 are
+// mandatory; the filter registers are best-effort and only populated (with
+// FilterPolledAt set) when both read successfully.
 func (p *PollController) PollSlow(ctx context.Context) (entity.Snapshot, error) {
 	in1, err := p.dispatcher.ReadInput(ctx, 0, 1)
 	if err != nil {
@@ -178,12 +180,45 @@ func (p *PollController) PollSlow(ctx context.Context) (entity.Snapshot, error) 
 		return entity.Snapshot{}, fmt.Errorf("poll_slow read h0: got %d regs: %w", len(hold), ErrUnexpectedReadLength)
 	}
 
-	return entity.Snapshot{
+	snap := entity.Snapshot{
 		Firmware:     valueobject.FirmwareFromRaw(in1[0]),
 		DeviceID:     in2[0],
 		DeviceConfig: entity.DeviceConfigFromRegister(hold[0]),
 		PolledAt:     p.clock.Now(),
-	}, nil
+	}
+
+	// h344 and h346 are read separately (h345 is undocumented) and
+	// best-effort: controller variants without them must not lose the
+	// firmware/device_id reads above.
+	resource, ok := p.readFilterRegister(ctx, 344)
+	if !ok {
+		return snap, nil
+	}
+	daysLeft, ok := p.readFilterRegister(ctx, 346)
+	if !ok {
+		return snap, nil
+	}
+
+	snap.FilterResource = resource
+	snap.FilterDaysLeft = int16(daysLeft) //nolint:gosec // same-size reinterpret; overdue filter reads negative days
+	snap.FilterPolledAt = p.clock.Now()
+	return snap, nil
+}
+
+// readFilterRegister reads one best-effort filter holding register. A failed
+// or short read is logged at Warn and reported as ok=false.
+func (p *PollController) readFilterRegister(ctx context.Context, addr uint16) (uint16, bool) {
+	regs, err := p.dispatcher.ReadHolding(ctx, addr, 1)
+	if err != nil {
+		p.logger.Warn("poll_slow filter register read failed", "register", fmt.Sprintf("h%d", addr), "error", err)
+		return 0, false
+	}
+	if len(regs) != 1 {
+		p.logger.Warn("poll_slow filter register read failed", "register", fmt.Sprintf("h%d", addr),
+			"error", fmt.Errorf("got %d regs: %w", len(regs), ErrUnexpectedReadLength))
+		return 0, false
+	}
+	return regs[0], true
 }
 
 // signedTempFromRaw decodes a signed int16 ×10 °C sensor reading. Out-of-

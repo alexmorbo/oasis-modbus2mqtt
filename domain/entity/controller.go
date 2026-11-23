@@ -16,6 +16,12 @@ import (
 // transiently return 0; the write path constructs a strict
 // valueobject.FanSpeed via NewFanSpeed instead.
 //
+// FilterResource (h344) and FilterDaysLeft (h346) are undocumented holding
+// registers in days; FilterPct (i14) is derived by the controller from them.
+// FilterDaysLeft is signed so an overdue filter reads negative. Both are
+// best-effort reads: FilterPolledAt is zero until they have been read
+// successfully at least once, and consumers must not publish them before.
+//
 // Errors is retained for backwards compatibility but is NOT populated by the
 // merger — RawErrors holds the raw register reads and DecodeErrorSet derives
 // a fresh ErrorSet on demand. Callers that need current error flags should
@@ -41,6 +47,9 @@ type Snapshot struct {
 	DamperOpen        bool
 	PIDDemand         uint16
 	FilterPct         int16
+	FilterResource    uint16
+	FilterDaysLeft    int16
+	FilterPolledAt    time.Time
 	Errors            ErrorSet
 	RawErrors         [4]uint16
 	RoomHumidity      uint16

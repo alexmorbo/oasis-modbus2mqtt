@@ -237,11 +237,18 @@ func (defaultMerger) MergeMedium(prev, partial entity.Snapshot) entity.Snapshot 
 	return prev
 }
 
-// MergeSlow copies the slow-tier fields from partial onto prev.
+// MergeSlow copies the slow-tier fields from partial onto prev. The filter
+// fields are best-effort and only copied when partial carries a successful
+// filter read (non-zero FilterPolledAt); otherwise prev's values are kept.
 func (defaultMerger) MergeSlow(prev, partial entity.Snapshot) entity.Snapshot {
 	prev.Firmware = partial.Firmware
 	prev.DeviceID = partial.DeviceID
 	prev.DeviceConfig = partial.DeviceConfig
+	if !partial.FilterPolledAt.IsZero() {
+		prev.FilterResource = partial.FilterResource
+		prev.FilterDaysLeft = partial.FilterDaysLeft
+		prev.FilterPolledAt = partial.FilterPolledAt
+	}
 	prev.PolledAt = partial.PolledAt
 	return prev
 }

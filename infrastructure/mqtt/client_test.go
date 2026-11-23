@@ -385,3 +385,112 @@ func TestPublish_ContextCancelled(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// TestConnect_ReturnsOnlyWhenUsable is the regression guard for the startup
+// race where Connect returned on the paho token while OnConnect (which flips
+// Connected) still ran asynchronously, so the first Publish failed with
+// ErrMQTTNotConnected.
+func TestConnect_ReturnsOnlyWhenUsable(t *testing.T) {
+	t.Parallel()
+	skipIfShort(t)
+
+	for i := range 10 {
+		c := mqtt.NewClient(newTestConfig(t), newTopicBuilder(t),
+			slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		require.NoError(t, c.Connect(ctx))
+		require.Truef(t, c.Connected(), "iteration %d: Connected() must be true when Connect returns", i)
+		require.NoErrorf(t, c.Publish(ctx, "test/ready/"+uuid.NewString(), []byte("x"), false),
+			"iteration %d: first Publish right after Connect must succeed", i)
+		cancel()
+		c.Disconnect(100 * time.Millisecond)
+	}
+}
+
+func TestOnConnectHook_RunsOnConnectAndReconnect(t *testing.T) {
+	t.Parallel()
+	skipIfShort(t)
+
+	cfg := newTestConfig(t)
+	cfg.QoS = 0 // paho v1.5.1 resume() races outgoing comms on in-flight QoS 1 packets under -race
+	c := mqtt.NewClient(cfg, newTopicBuilder(t),
+		slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { c.Disconnect(100 * time.Millisecond) })
+
+	hookTopic := "test/hook/" + uuid.NewString()
+	ch := newRawSubscriber(t, hookTopic)
+
+	var (
+		runs        atomic.Int32
+		sawOffline  atomic.Bool
+		hadDeadline atomic.Bool
+	)
+	c.AddOnConnectHook(nil)
+	c.AddOnConnectHook(func(ctx context.Context) {
+		if !c.Connected() {
+			sawOffline.Store(true)
+		}
+		_, ok := ctx.Deadline()
+		hadDeadline.Store(ok)
+		n := runs.Add(1)
+		_ = c.Publish(ctx, hookTopic, fmt.Appendf(nil, "run-%d", n), false)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, c.Connect(ctx))
+
+	select {
+	case msg := <-ch:
+		assert.Equal(t, []byte("run-1"), msg.Payload)
+	case <-time.After(5 * time.Second):
+		t.Fatal("on-connect hook did not publish after initial connect")
+	}
+
+	// Session takeover: a second client with the same ClientID makes the
+	// broker drop the bridge connection; paho auto-reconnects.
+	intruder := paho.NewClient(paho.NewClientOptions().
+		AddBroker("tcp://" + sharedBroker).
+		SetClientID(cfg.ClientID).
+		SetCleanSession(true).
+		SetAutoReconnect(false))
+	tok := intruder.Connect()
+	require.True(t, tok.WaitTimeout(5*time.Second))
+	require.NoError(t, tok.Error())
+	intruder.Disconnect(0)
+
+	// A redelivered run-1 is tolerated; only run-2 proves the reconnect hook ran.
+	deadline := time.After(30 * time.Second)
+waitRun2:
+	for {
+		select {
+		case msg := <-ch:
+			if string(msg.Payload) == "run-2" {
+				break waitRun2
+			}
+			require.Equal(t, "run-1", string(msg.Payload), "unexpected hook payload")
+		case <-deadline:
+			t.Fatal("on-connect hook did not run after reconnect")
+		}
+	}
+	assert.True(t, c.Connected())
+	assert.False(t, sawOffline.Load(), "hooks must observe a connected client")
+	assert.True(t, hadDeadline.Load(), "hook context must be bounded")
+}
+
+func TestConnect_ContextCancelledWhileBrokerUnreachable(t *testing.T) {
+	t.Parallel()
+	c := mqtt.NewClient(config.MQTTConfig{
+		Broker: "127.0.0.1:1", ClientID: "no-conn-ctx", Keepalive: time.Second, QoS: 1,
+	}, newTopicBuilder(t), slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	var runs atomic.Int32
+	c.AddOnConnectHook(func(context.Context) { runs.Add(1) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := c.Connect(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.False(t, c.Connected())
+	assert.Equal(t, int32(0), runs.Load())
+}

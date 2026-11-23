@@ -68,6 +68,7 @@ func TestDeviceClassConstants(t *testing.T) {
 	assert.Equal(t, catalog.DeviceClass("problem"), catalog.DeviceClassProblem)
 	assert.Equal(t, catalog.DeviceClass("running"), catalog.DeviceClassRunning)
 	assert.Equal(t, catalog.DeviceClass("power"), catalog.DeviceClassPower)
+	assert.Equal(t, catalog.DeviceClass("duration"), catalog.DeviceClassDuration)
 }
 
 func TestStateClassConstants(t *testing.T) {

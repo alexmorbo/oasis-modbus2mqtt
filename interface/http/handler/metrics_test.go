@@ -31,7 +31,7 @@ func TestPrometheus_Returns200WithText(t *testing.T) {
 	h := handler.NewMetrics()
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	c.Request = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
 
 	h.Prometheus(c)
 

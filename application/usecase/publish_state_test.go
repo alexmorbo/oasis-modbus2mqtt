@@ -102,6 +102,9 @@ func sampleSnapshot(t *testing.T) entity.Snapshot {
 		DamperOpen:        true,
 		PIDDemand:         42,
 		FilterPct:         15,
+		FilterResource:    150,
+		FilterDaysLeft:    120,
+		FilterPolledAt:    time.Date(2026, 4, 25, 14, 0, 0, 0, time.UTC),
 		RoomHumidity:      55,
 	}
 }
@@ -137,7 +140,7 @@ func TestApply_PublishesAllOnFirstCall(t *testing.T) {
 	require.NoError(t, err)
 
 	calls := pub.snapshot()
-	assert.Len(t, calls, 19)
+	assert.Len(t, calls, 21)
 	for _, c := range calls {
 		assert.True(t, c.retained, "state messages must be retained, got non-retained for %s", c.topic)
 	}
@@ -177,6 +180,14 @@ func TestApply_PublishesAllOnFirstCall(t *testing.T) {
 	c, ok = pub.findCall("test/state/problem")
 	require.True(t, ok)
 	assert.Equal(t, []byte("OFF"), c.payload)
+
+	c, ok = pub.findCall("test/state/filter_days_left")
+	require.True(t, ok)
+	assert.Equal(t, []byte("120"), c.payload)
+
+	c, ok = pub.findCall("test/state/filter_resource")
+	require.True(t, ok)
+	assert.Equal(t, []byte("150"), c.payload)
 }
 
 func TestApply_RepublishesAllOnEveryCall(t *testing.T) {
@@ -190,7 +201,7 @@ func TestApply_RepublishesAllOnEveryCall(t *testing.T) {
 	}
 
 	calls := pub.snapshot()
-	assert.Len(t, calls, 57, "three identical Apply calls must publish 19×3 messages")
+	assert.Len(t, calls, 63, "three identical Apply calls must publish 21×3 messages")
 	for _, c := range calls {
 		assert.True(t, c.retained, "every state publish must be retained")
 	}
@@ -206,7 +217,7 @@ func TestApply_AlwaysRetainsState(t *testing.T) {
 	require.NoError(t, ps.Apply(context.Background(), sampleSnapshot(t)))
 
 	calls := pub.snapshot()
-	require.Len(t, calls, 19)
+	require.Len(t, calls, 21)
 	for _, c := range calls {
 		assert.True(t, c.retained, "retained flag must be true on %s", c.topic)
 	}
@@ -239,7 +250,7 @@ func TestApply_ErrorOnOneTopic_DoesNotSkipOthers(t *testing.T) {
 	assert.ErrorIs(t, err, sentinel)
 
 	calls := pub.snapshot()
-	assert.Len(t, calls, 19, "all 19 publish attempts must be made even when one fails")
+	assert.Len(t, calls, 21, "all 21 publish attempts must be made even when one fails")
 }
 
 func TestHvacMode_PowerOff(t *testing.T) {
@@ -445,7 +456,7 @@ func TestApply_ZeroSnapshot_PublishesDefaults(t *testing.T) {
 
 	require.NoError(t, ps.Apply(context.Background(), entity.Snapshot{}))
 	calls := pub.snapshot()
-	assert.Len(t, calls, 19)
+	assert.Len(t, calls, 19, "filter topics are omitted until the first successful filter read")
 
 	c, ok := pub.findCall("test/state/firmware")
 	require.True(t, ok)
@@ -474,6 +485,65 @@ func TestApply_ZeroSnapshot_PublishesDefaults(t *testing.T) {
 	c, ok = pub.findCall("test/state/supply_temperature")
 	require.True(t, ok)
 	assert.Equal(t, []byte("0.0"), c.payload)
+
+	_, ok = pub.findCall("test/state/filter_days_left")
+	assert.False(t, ok, "filter_days_left must not publish a bogus 0 before the first filter read")
+
+	_, ok = pub.findCall("test/state/filter_resource")
+	assert.False(t, ok, "filter_resource must not publish a bogus 0 before the first filter read")
+}
+
+func TestApply_FilterTopicsGatedOnFilterPolledAt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		mutate       func(s *entity.Snapshot)
+		wantCount    int
+		wantDaysLeft string
+	}{
+		{
+			name:      "filter not yet read",
+			mutate:    func(s *entity.Snapshot) { s.FilterPolledAt = time.Time{} },
+			wantCount: 19,
+		},
+		{
+			name:         "filter read",
+			mutate:       func(*entity.Snapshot) {},
+			wantCount:    21,
+			wantDaysLeft: "120",
+		},
+		{
+			name:         "overdue filter renders negative days",
+			mutate:       func(s *entity.Snapshot) { s.FilterDaysLeft = -3 },
+			wantCount:    21,
+			wantDaysLeft: "-3",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pub := &fakeStatePublisher{}
+			ps := usecase.NewPublishState(pub, fakeTopics{}, discardLoggerState())
+			snap := sampleSnapshot(t)
+			tc.mutate(&snap)
+
+			require.NoError(t, ps.Apply(context.Background(), snap))
+			assert.Len(t, pub.snapshot(), tc.wantCount)
+
+			days, okDays := pub.findCall("test/state/filter_days_left")
+			_, okRes := pub.findCall("test/state/filter_resource")
+			if tc.wantDaysLeft == "" {
+				assert.False(t, okDays)
+				assert.False(t, okRes)
+				return
+			}
+			require.True(t, okDays)
+			assert.True(t, okRes)
+			assert.Equal(t, []byte(tc.wantDaysLeft), days.payload)
+		})
+	}
 }
 
 func TestApply_LogsPublishedCount(t *testing.T) {
@@ -485,5 +555,5 @@ func TestApply_LogsPublishedCount(t *testing.T) {
 	require.NoError(t, ps.Apply(context.Background(), sampleSnapshot(t)))
 	out := buf.String()
 	assert.Contains(t, out, "state published")
-	assert.Contains(t, out, `"count":19`)
+	assert.Contains(t, out, `"count":21`)
 }

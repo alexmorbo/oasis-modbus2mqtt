@@ -23,9 +23,18 @@ const (
 	AvailabilityOffline = "offline"
 )
 
+// onConnectHookTimeout bounds the context handed to each on-connect hook.
+const onConnectHookTimeout = 30 * time.Second
+
+// OnConnectHook runs after every successful (re)connect, once availability
+// and subscriptions are restored. The context is bounded by
+// onConnectHookTimeout.
+type OnConnectHook func(ctx context.Context)
+
 // Client is an MQTTPublisher backed by paho.mqtt.golang v3. It owns a
 // single broker connection, restores subscriptions on reconnect from a
-// local registry, and exposes a non-blocking Connected() probe.
+// local registry, runs registered on-connect hooks, and exposes a
+// non-blocking Connected() probe.
 type Client struct {
 	cfg    config.MQTTConfig
 	topics *TopicBuilder
@@ -34,6 +43,10 @@ type Client struct {
 	mu     sync.Mutex
 	client paho.Client
 	subs   map[string]port.MessageHandler
+	hooks  []OnConnectHook
+	// ready is closed by onConnect once the connection is usable; Connect
+	// replaces it before dialling so each Connect waits on its own session.
+	ready chan struct{}
 
 	connectedAtomic atomic.Bool
 }
@@ -53,12 +66,28 @@ func NewClient(cfg config.MQTTConfig, topics *TopicBuilder, logger *slog.Logger)
 		topics: topics,
 		logger: logger,
 		subs:   make(map[string]port.MessageHandler),
+		ready:  make(chan struct{}),
 	}
 }
 
+// AddOnConnectHook registers hook to run after every (re)connect. Register
+// hooks before Connect so the initial connection triggers them too. Hooks
+// run sequentially on paho's OnConnect goroutine, never under the client
+// mutex, so they may call Publish/Subscribe.
+func (c *Client) AddOnConnectHook(hook OnConnectHook) {
+	if hook == nil {
+		return
+	}
+	c.mu.Lock()
+	c.hooks = append(c.hooks, hook)
+	c.mu.Unlock()
+}
+
 // Connect opens the broker connection, configures LWT, and registers
-// callbacks. It blocks until the broker accepts the connection or ctx is
-// cancelled. Subsequent reconnects are handled by paho automatically.
+// callbacks. It blocks until the connection is usable (Connected() is true)
+// or ctx is cancelled. paho delivers OnConnect on its own goroutine after
+// the connect token completes, so waiting on the token alone races with
+// the state transition. Subsequent reconnects are handled by paho.
 func (c *Client) Connect(ctx context.Context) error {
 	opts := paho.NewClientOptions().
 		AddBroker("tcp://"+c.cfg.Broker).
@@ -80,6 +109,8 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	c.client = paho.NewClient(opts)
 	client := c.client
+	ready := make(chan struct{})
+	c.ready = ready
 	c.mu.Unlock()
 
 	token := client.Connect()
@@ -91,7 +122,13 @@ func (c *Client) Connect(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return nil
+
+	select {
+	case <-ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Disconnect publishes availability=offline (best effort) and tears the
@@ -195,23 +232,33 @@ func (c *Client) Connected() bool {
 	return c.connectedAtomic.Load()
 }
 
-func (c *Client) onConnect(_ paho.Client) {
-	c.connectedAtomic.Store(true)
-	metrics.SetMQTTConnected(true)
-	metrics.MQTTReconnectsTotal.Inc()
-	c.logger.Info("mqtt connected", "broker", c.cfg.Broker, "client_id", c.cfg.ClientID)
-
+func (c *Client) onConnect(pc paho.Client) {
 	c.mu.Lock()
 	client := c.client
+	if client == nil || pc != client {
+		// Stale callback from a client replaced by a later Connect (e.g.
+		// Connect→Disconnect→Connect): it must not flip state or run hooks.
+		c.mu.Unlock()
+		c.logger.Debug("mqtt ignoring on-connect from stale client")
+		return
+	}
 	subsCopy := make(map[string]port.MessageHandler, len(c.subs))
 	for topic, handler := range c.subs {
 		subsCopy[topic] = handler
 	}
+	hooks := append([]OnConnectHook(nil), c.hooks...)
+	// Connected must be true before ready is closed: Connect returns on ready.
+	c.connectedAtomic.Store(true)
+	select {
+	case <-c.ready:
+	default:
+		close(c.ready)
+	}
 	c.mu.Unlock()
 
-	if client == nil {
-		return
-	}
+	metrics.SetMQTTConnected(true)
+	metrics.MQTTReconnectsTotal.Inc()
+	c.logger.Info("mqtt connected", "broker", c.cfg.Broker, "client_id", c.cfg.ClientID)
 
 	token := client.Publish(c.topics.Availability(), c.cfg.QoS, true, AvailabilityOnline)
 	if !token.WaitTimeout(2 * time.Second) {
@@ -231,6 +278,16 @@ func (c *Client) onConnect(_ paho.Client) {
 			continue
 		}
 		c.logger.Info("mqtt resubscribed", "topic", topic)
+	}
+
+	c.runHooks(hooks)
+}
+
+func (c *Client) runHooks(hooks []OnConnectHook) {
+	for _, hook := range hooks {
+		ctx, cancel := context.WithTimeout(context.Background(), onConnectHookTimeout)
+		hook(ctx)
+		cancel()
 	}
 }
 

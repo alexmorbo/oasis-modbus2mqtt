@@ -18,7 +18,8 @@ import (
 
 // preset writes the test fixture register values onto the mbserver. The
 // values match the AC: firmware v5.2.0, PowerOn=true with HEAT mode,
-// supply temp 22.0 °C, room temp 23.5 °C, target 22.0 °C, electric heater.
+// supply temp 22.0 °C, room temp 23.5 °C, target 22.0 °C, electric heater,
+// filter resource 150 days with 120 days left.
 func preset(s *mbserver.Server) {
 	s.InputRegisters[0] = 0x5200    // Firmware v5.2.0
 	s.InputRegisters[2] = 0x0141    // State_0: PowerOn=1, HeatCapable, mode=HEAT
@@ -27,6 +28,8 @@ func preset(s *mbserver.Server) {
 	s.HoldingRegisters[0] = 0x0001  // Type_Dev: electric heater
 	s.HoldingRegisters[31] = 220    // Target 22.0 °C (×0.1)
 	s.HoldingRegisters[86] = 0x0001 // ModeHeat
+	s.HoldingRegisters[344] = 150   // Filter resource, days
+	s.HoldingRegisters[346] = 120   // Filter days left
 }
 
 // TestE2E_FullLoop boots the wired application against an in-process
@@ -48,50 +51,13 @@ func TestE2E_FullLoop(t *testing.T) {
 
 	mqttBroker := startMosquitto(t)
 
-	modbusHost, modbusPort := splitAddr(t, modbusAddr)
-	cfg := &config.Config{
-		Modbus: config.ModbusConfig{
-			Host:           modbusHost,
-			Port:           modbusPort,
-			SlaveID:        1,
-			ConnectTimeout: 2 * time.Second,
-			ReadTimeout:    1 * time.Second,
-			WriteTimeout:   1 * time.Second,
-			GuardInterval:  20 * time.Millisecond,
-		},
-		MQTT: config.MQTTConfig{
-			Broker:    mqttBroker,
-			ClientID:  "oasis-e2e-bridge-" + uuid.NewString(),
-			Keepalive: 5 * time.Second,
-			QoS:       1,
-		},
-		HomeAssistant: config.HAConfig{
-			DiscoveryPrefix: "homeassistant",
-			DevicePrefix:    "oasis_test",
-			DeviceName:      "Oasis E2E",
-			Manufacturer:    "Syberia",
-			Model:           "TestModel",
-		},
-		Polling: config.PollingConfig{
-			HotInterval:           200 * time.Millisecond,
-			MediumInterval:        400 * time.Millisecond,
-			SlowInterval:          1 * time.Second,
-			AvailabilityThreshold: 2 * time.Second,
-		},
-		HTTP:   config.HTTPConfig{Port: 0},
-		Logger: config.LoggerConfig{Level: "warn"},
-		Reconnect: config.ReconnectConfig{
-			MinDelay:  1 * time.Millisecond,
-			MaxDelay:  10 * time.Millisecond,
-			Factor:    2.0,
-			JitterPct: 0,
-		},
-	}
+	cfg := e2eConfig(t, modbusAddr, mqttBroker)
 
 	testClient := newTestPahoClient(t, mqttBroker, "test-observer-"+uuid.NewString())
 	discoveryGetter := subscribeAndCollect(t, testClient, "homeassistant/+/oasis_test/+/config")
 	stateGetter := subscribeAndCollect(t, testClient, "oasis_test/state/+")
 	availabilityGetter := subscribeAndCollect(t, testClient, "oasis_test/availability")
+	daysLeftHistory := subscribeAndRecordAll(t, testClient, "oasis_test/state/filter_days_left")
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	a, err := app.New(cfg, logger)
@@ -106,8 +72,20 @@ func TestE2E_FullLoop(t *testing.T) {
 	}, 30*time.Second, 100*time.Millisecond, "availability=online")
 
 	assert.Eventually(t, func() bool {
-		return len(discoveryGetter()) >= 13
-	}, 30*time.Second, 200*time.Millisecond, "at least 13 discovery configs published")
+		return len(discoveryGetter()) == 18
+	}, 30*time.Second, 200*time.Millisecond, "18 discovery configs published on initial connect")
+
+	configs := discoveryGetter()
+	assert.Contains(t, string(configs["homeassistant/sensor/oasis_test/filter_days_left/config"]), `"device_class":"duration"`)
+	assert.Contains(t, string(configs["homeassistant/sensor/oasis_test/filter_resource/config"]), `"entity_category":"diagnostic"`)
+
+	assert.Eventually(t, func() bool {
+		states := stateGetter()
+		return string(states["oasis_test/state/filter_days_left"]) == "120" &&
+			string(states["oasis_test/state/filter_resource"]) == "150"
+	}, 5*time.Second, 100*time.Millisecond, "filter_days_left=120 and filter_resource=150")
+	assert.NotContains(t, daysLeftHistory(), "0",
+		"filter_days_left must never publish a placeholder 0 before the slow tier has read h346")
 
 	assert.Eventually(t, func() bool {
 		states := stateGetter()
@@ -175,45 +153,7 @@ func TestRetainedStateSurvivesSubscriberReconnect(t *testing.T) {
 
 	mqttBroker := startMosquitto(t)
 
-	modbusHost, modbusPort := splitAddr(t, modbusAddr)
-	cfg := &config.Config{
-		Modbus: config.ModbusConfig{
-			Host:           modbusHost,
-			Port:           modbusPort,
-			SlaveID:        1,
-			ConnectTimeout: 2 * time.Second,
-			ReadTimeout:    1 * time.Second,
-			WriteTimeout:   1 * time.Second,
-			GuardInterval:  20 * time.Millisecond,
-		},
-		MQTT: config.MQTTConfig{
-			Broker:    mqttBroker,
-			ClientID:  "oasis-e2e-bridge-" + uuid.NewString(),
-			Keepalive: 5 * time.Second,
-			QoS:       1,
-		},
-		HomeAssistant: config.HAConfig{
-			DiscoveryPrefix: "homeassistant",
-			DevicePrefix:    "oasis_test",
-			DeviceName:      "Oasis E2E",
-			Manufacturer:    "Syberia",
-			Model:           "TestModel",
-		},
-		Polling: config.PollingConfig{
-			HotInterval:           200 * time.Millisecond,
-			MediumInterval:        400 * time.Millisecond,
-			SlowInterval:          1 * time.Second,
-			AvailabilityThreshold: 2 * time.Second,
-		},
-		HTTP:   config.HTTPConfig{Port: 0},
-		Logger: config.LoggerConfig{Level: "warn"},
-		Reconnect: config.ReconnectConfig{
-			MinDelay:  1 * time.Millisecond,
-			MaxDelay:  10 * time.Millisecond,
-			Factor:    2.0,
-			JitterPct: 0,
-		},
-	}
+	cfg := e2eConfig(t, modbusAddr, mqttBroker)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	a, err := app.New(cfg, logger)
@@ -257,5 +197,113 @@ func TestRetainedStateSurvivesSubscriberReconnect(t *testing.T) {
 		require.NoError(t, runErr, "app.Run should return cleanly on ctx cancel")
 	case <-time.After(15 * time.Second):
 		t.Fatal("app.Run did not return within shutdown timeout")
+	}
+}
+
+// TestDiscoveryRepublishedOnMQTTReconnect drops the bridge's broker session
+// (session takeover by a client with the same ClientID) after wiping a
+// retained discovery config, and asserts the on-connect hook republishes
+// discovery without any HA birth message. Regression guard for discovery
+// lost after a broker restart without persistence.
+//
+//nolint:misspell // mosquitto is the broker's correct name
+func TestDiscoveryRepublishedOnMQTTReconnect(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e test requires Docker; skipped under -short")
+	}
+	if raceEnabled {
+		t.Skip("e2e: skipping under -race due to known mbserver upstream data race on HoldingRegisters slice")
+	}
+
+	server, modbusAddr := startMbserver(t)
+	preset(server)
+	mqttBroker := startMosquitto(t)
+	cfg := e2eConfig(t, modbusAddr, mqttBroker)
+
+	a, err := app.New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	const configTopic = "homeassistant/sensor/oasis_test/filter_days_left/config"
+	observer := newTestPahoClient(t, mqttBroker, "test-observer-"+uuid.NewString())
+	discoveryGetter := subscribeAndCollect(t, observer, "homeassistant/+/oasis_test/+/config")
+
+	assert.Eventually(t, func() bool {
+		return len(discoveryGetter()[configTopic]) > 0
+	}, 30*time.Second, 100*time.Millisecond, "initial discovery for filter_days_left")
+
+	// Wipe the retained config, as a broker restart without persistence would.
+	tok := observer.Publish(configTopic, 1, true, []byte{})
+	require.True(t, tok.WaitTimeout(2*time.Second))
+	require.NoError(t, tok.Error())
+	assert.Eventually(t, func() bool {
+		return len(discoveryGetter()[configTopic]) == 0
+	}, 5*time.Second, 50*time.Millisecond, "retained config cleared")
+
+	intruder := newTestPahoClient(t, mqttBroker, cfg.MQTT.ClientID)
+	intruder.Disconnect(0)
+
+	assert.Eventually(t, func() bool {
+		return len(discoveryGetter()[configTopic]) > 0
+	}, 30*time.Second, 100*time.Millisecond, "discovery republished after MQTT reconnect")
+
+	late := newTestPahoClient(t, mqttBroker, "test-late-"+uuid.NewString())
+	lateGetter := subscribeAndCollect(t, late, configTopic)
+	assert.Eventually(t, func() bool {
+		return len(lateGetter()[configTopic]) > 0
+	}, 5*time.Second, 50*time.Millisecond, "republished config is retained")
+
+	cancel()
+	select {
+	case runErr := <-done:
+		require.NoError(t, runErr, "app.Run should return cleanly on ctx cancel")
+	case <-time.After(15 * time.Second):
+		t.Fatal("app.Run did not return within shutdown timeout")
+	}
+}
+
+func e2eConfig(t *testing.T, modbusAddr, mqttBroker string) *config.Config {
+	t.Helper()
+	modbusHost, modbusPort := splitAddr(t, modbusAddr)
+	return &config.Config{
+		Modbus: config.ModbusConfig{
+			Host:           modbusHost,
+			Port:           modbusPort,
+			SlaveID:        1,
+			ConnectTimeout: 2 * time.Second,
+			ReadTimeout:    1 * time.Second,
+			WriteTimeout:   1 * time.Second,
+			GuardInterval:  20 * time.Millisecond,
+		},
+		MQTT: config.MQTTConfig{
+			Broker:    mqttBroker,
+			ClientID:  "oasis-e2e-bridge-" + uuid.NewString(),
+			Keepalive: 5 * time.Second,
+			QoS:       1,
+		},
+		HomeAssistant: config.HAConfig{
+			DiscoveryPrefix: "homeassistant",
+			DevicePrefix:    "oasis_test",
+			DeviceName:      "Oasis E2E",
+			Manufacturer:    "Syberia",
+			Model:           "TestModel",
+		},
+		Polling: config.PollingConfig{
+			HotInterval:           200 * time.Millisecond,
+			MediumInterval:        400 * time.Millisecond,
+			SlowInterval:          1 * time.Second,
+			AvailabilityThreshold: 2 * time.Second,
+		},
+		HTTP:   config.HTTPConfig{Port: 0},
+		Logger: config.LoggerConfig{Level: "warn"},
+		Reconnect: config.ReconnectConfig{
+			MinDelay:  1 * time.Millisecond,
+			MaxDelay:  10 * time.Millisecond,
+			Factor:    2.0,
+			JitterPct: 0,
+		},
 	}
 }

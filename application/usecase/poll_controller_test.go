@@ -1,9 +1,12 @@
 package usecase_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -326,6 +329,8 @@ func TestPollSlow_DecodesAllFields(t *testing.T) {
 	d.inputResp[key(0, 1)] = []uint16{0x5210}   // Firmware v5.2.1.0 → "v5.2.1"
 	d.inputResp[key(79, 1)] = []uint16{0x4242}  // DeviceID
 	d.holdingResp[key(0, 1)] = []uint16{0x0121} // heater=1, cooler=2, recup=1
+	d.holdingResp[key(344, 1)] = []uint16{150}  // filter resource, days
+	d.holdingResp[key(346, 1)] = []uint16{120}  // filter days left
 
 	clk := fakeClock{now: time.Date(2026, 4, 25, 14, 0, 0, 0, time.UTC)}
 	pc := usecase.NewPollController(d, clk, nil)
@@ -337,7 +342,109 @@ func TestPollSlow_DecodesAllFields(t *testing.T) {
 	assert.Equal(t, entity.HeaterElectric, snap.DeviceConfig.Heater)
 	assert.Equal(t, entity.CoolerFancoil, snap.DeviceConfig.Cooler)
 	assert.Equal(t, entity.RecuperatorPlate, snap.DeviceConfig.Recuperator)
+	assert.Equal(t, uint16(150), snap.FilterResource)
+	assert.Equal(t, int16(120), snap.FilterDaysLeft)
 	assert.Equal(t, clk.now, snap.PolledAt)
+	assert.Equal(t, clk.now, snap.FilterPolledAt, "both filter reads succeeded")
+	assert.Equal(t, 3, d.holdCalls, "h0, h344 and h346 are separate single-register reads")
+}
+
+func TestPollSlow_FilterDaysLeftSigned(t *testing.T) {
+	t.Parallel()
+
+	d := newFakeDispatcher()
+	d.inputResp[key(0, 1)] = make([]uint16, 1)
+	d.inputResp[key(79, 1)] = make([]uint16, 1)
+	d.holdingResp[key(0, 1)] = make([]uint16, 1)
+	d.holdingResp[key(344, 1)] = []uint16{150}
+	d.holdingResp[key(346, 1)] = []uint16{0xFFFD} // overdue by 3 days
+
+	pc := usecase.NewPollController(d, fakeClock{now: time.Unix(1, 0)}, nil)
+	snap, err := pc.PollSlow(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, int16(-3), snap.FilterDaysLeft)
+	assert.False(t, snap.FilterPolledAt.IsZero())
+}
+
+// TestPollSlow_FilterReadsBestEffort verifies that a failed or short h344/h346
+// read does not fail the slow tier: firmware and device_id are still returned,
+// the filter fields stay zero, FilterPolledAt stays zero, and a Warn naming
+// the register is logged.
+// TestPollSlow_FilterReadsBestEffort verifies that a failed or short h344/h346
+// read does not fail the slow tier: firmware and device_id are still returned,
+// the filter fields stay zero, FilterPolledAt stays zero, and a Warn naming
+// the register is logged.
+func TestPollSlow_FilterReadsBestEffort(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		setup        func(d *fakeDispatcher)
+		wantRegister string
+		wantHolds    int
+	}{
+		{
+			name:         "h344 read error",
+			setup:        func(d *fakeDispatcher) { d.holdingErr[key(344, 1)] = errFakeRead },
+			wantRegister: "h344",
+			wantHolds:    2,
+		},
+		{
+			name:         "h344 wrong length",
+			setup:        func(d *fakeDispatcher) { d.holdingResp[key(344, 1)] = make([]uint16, 2) },
+			wantRegister: "h344",
+			wantHolds:    2,
+		},
+		{
+			name: "h346 read error",
+			setup: func(d *fakeDispatcher) {
+				d.holdingResp[key(344, 1)] = []uint16{150}
+				d.holdingErr[key(346, 1)] = errFakeRead
+			},
+			wantRegister: "h346",
+			wantHolds:    3,
+		},
+		{
+			name: "h346 wrong length",
+			setup: func(d *fakeDispatcher) {
+				d.holdingResp[key(344, 1)] = []uint16{150}
+				d.holdingResp[key(346, 1)] = make([]uint16, 0)
+			},
+			wantRegister: "h346",
+			wantHolds:    3,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := newFakeDispatcher()
+			d.inputResp[key(0, 1)] = []uint16{0x5210}
+			d.inputResp[key(79, 1)] = []uint16{0x4242}
+			d.holdingResp[key(0, 1)] = []uint16{0x0121}
+			tc.setup(d)
+
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			clk := fakeClock{now: time.Date(2026, 4, 25, 14, 0, 0, 0, time.UTC)}
+			pc := usecase.NewPollController(d, clk, logger)
+
+			snap, err := pc.PollSlow(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, "v5.2.1", snap.Firmware.String())
+			assert.Equal(t, uint16(0x4242), snap.DeviceID)
+			assert.Equal(t, entity.HeaterElectric, snap.DeviceConfig.Heater)
+			assert.Equal(t, clk.now, snap.PolledAt)
+			assert.True(t, snap.FilterPolledAt.IsZero())
+			assert.Zero(t, snap.FilterResource)
+			assert.Zero(t, snap.FilterDaysLeft)
+			assert.Equal(t, tc.wantHolds, d.holdCalls)
+
+			out := buf.String()
+			assert.Equal(t, 1, strings.Count(out, "level=WARN"), "exactly one warn per failed filter read")
+			assert.Contains(t, out, "register="+tc.wantRegister)
+		})
+	}
 }
 
 func TestPollSlow_FirstReadError(t *testing.T) {
@@ -658,7 +765,7 @@ func TestPollMedium_LengthMismatch(t *testing.T) {
 }
 
 // TestPollSlow_ReadErrors verifies that an error from any of the three
-// slow-tier reads is propagated with the address-range hint.
+// mandatory slow-tier reads is propagated with the address-range hint.
 func TestPollSlow_ReadErrors(t *testing.T) {
 	t.Parallel()
 
@@ -709,7 +816,7 @@ func TestPollSlow_ReadErrors(t *testing.T) {
 }
 
 // TestPollSlow_LengthMismatch verifies that a wrong-length response from any
-// slow-tier read returns an error wrapping ErrUnexpectedReadLength.
+// mandatory slow-tier read returns an error wrapping ErrUnexpectedReadLength.
 func TestPollSlow_LengthMismatch(t *testing.T) {
 	t.Parallel()
 

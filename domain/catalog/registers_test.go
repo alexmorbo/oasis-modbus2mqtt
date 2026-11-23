@@ -73,7 +73,7 @@ func TestRegistersByGroup(t *testing.T) {
 	}{
 		{name: "hot", group: catalog.PollGroupHot, mustHave: []string{"State_0", "TkanK", "Temp_Target", "Fan_Target_1"}},
 		{name: "medium", group: catalog.PollGroupMedium, mustHave: []string{"TKomn_x10_P", "Dev_Keys_2"}},
-		{name: "slow", group: catalog.PollGroupSlow, mustHave: []string{"Firmware", "DeviceID", "Type_Dev"}},
+		{name: "slow", group: catalog.PollGroupSlow, mustHave: []string{"Firmware", "DeviceID", "Type_Dev", "Filtr1_Resurs", "Filtr1_Ostatok"}},
 		{name: "none", group: catalog.PollGroupNone, mustHave: []string{"Power_Dev"}},
 	}
 
@@ -108,6 +108,9 @@ func TestRegisterByAddr(t *testing.T) {
 		{name: "input TkanK", kind: valueobject.RegisterKindInput, addr: 9, wantName: "TkanK", wantOK: true},
 		{name: "holding type_dev", kind: valueobject.RegisterKindHolding, addr: 0, wantName: "Type_Dev", wantOK: true},
 		{name: "holding power_dev", kind: valueobject.RegisterKindHolding, addr: 2, wantName: "Power_Dev", wantOK: true},
+		{name: "holding filter resource", kind: valueobject.RegisterKindHolding, addr: 344, wantName: "Filtr1_Resurs", wantOK: true},
+		{name: "holding filter days left", kind: valueobject.RegisterKindHolding, addr: 346, wantName: "Filtr1_Ostatok", wantOK: true},
+		{name: "holding h345 not cataloged", kind: valueobject.RegisterKindHolding, addr: 345, wantOK: false},
 		{name: "missing input", kind: valueobject.RegisterKindInput, addr: 9999, wantOK: false},
 		{name: "kind mismatch", kind: valueobject.RegisterKindHolding, addr: 9, wantOK: false},
 		{name: "invalid kind", kind: valueobject.RegisterKind(0), addr: 0, wantOK: false},
@@ -144,7 +147,8 @@ func TestRegistersWithEntity(t *testing.T) {
 		names[r.Name] = true
 	}
 	for _, expected := range []string{"TkanK", "ZagrFiltr1", "Reg", "Fan_State_1", "Fan_State_2",
-		"TKomn_x10_P", "Room_Hum_P", "Firmware", "DeviceID", "Last_Time", "Power_Dev"} {
+		"TKomn_x10_P", "Room_Hum_P", "Firmware", "DeviceID", "Last_Time", "Power_Dev",
+		"Filtr1_Resurs", "Filtr1_Ostatok"} {
 		assert.Truef(t, names[expected], "expected register %s to be returned by RegistersWithEntity", expected)
 	}
 
@@ -153,5 +157,49 @@ func TestRegistersWithEntity(t *testing.T) {
 		"Error_Code_2", "Error_Code_3", "DOutputs", "Type_Dev",
 		"Temp_Target", "Fan_Target_1", "Dev_Keys_2"} {
 		assert.Falsef(t, names[excluded], "register %s must not be returned by RegistersWithEntity", excluded)
+	}
+}
+
+func TestRegisters_FilterDaysEntries(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		addr     uint16
+		wantName string
+		wantHint catalog.EntityHint
+	}{
+		{
+			name:     "h346 filter days left",
+			addr:     346,
+			wantName: "Filtr1_Ostatok",
+			wantHint: catalog.EntityHint{
+				Kind: catalog.EntityKindSensor, ObjectID: "filter_days_left", Name: "Filter days left",
+				DeviceClass: catalog.DeviceClassDuration, Unit: "d",
+				StateClass: catalog.StateClassMeasurement, Icon: "mdi:air-filter",
+			},
+		},
+		{
+			name:     "h344 filter resource",
+			addr:     344,
+			wantName: "Filtr1_Resurs",
+			wantHint: catalog.EntityHint{
+				Kind: catalog.EntityKindSensor, ObjectID: "filter_resource", Name: "Filter resource",
+				DeviceClass: catalog.DeviceClassDuration, Unit: "d",
+				Category: catalog.EntityCategoryDiagnostic, Icon: "mdi:air-filter",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r, ok := catalog.RegisterByAddr(valueobject.RegisterKindHolding, tc.addr)
+			require.True(t, ok)
+			assert.Equal(t, tc.wantName, r.Name)
+			assert.Equal(t, catalog.PollGroupSlow, r.Group)
+			assert.Equal(t, tc.wantHint, r.Hint)
+			assert.Contains(t, r.Description, "undocumented")
+		})
 	}
 }

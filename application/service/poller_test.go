@@ -179,6 +179,63 @@ func TestMerge_TierFieldIsolation(t *testing.T) {
 	}, 1*time.Second, 1*time.Millisecond, "all tier fields must coexist after merges")
 }
 
+func TestMergeSlow_CopiesFilterDays(t *testing.T) {
+	t.Parallel()
+
+	fns := &fakePollFns{
+		hotSnap:  entity.Snapshot{PowerOn: true, FilterPct: 20},
+		medSnap:  entity.Snapshot{RoomHumidity: 70},
+		slowSnap: entity.Snapshot{DeviceID: 1234, FilterResource: 150, FilterDaysLeft: 120, FilterPolledAt: time.Unix(100, 0)},
+	}
+	p := fastPoller(t, fns)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+
+	assert.Eventually(t, func() bool {
+		return fns.hotN.Load() >= 3 && fns.slowN.Load() >= 2
+	}, 1*time.Second, 1*time.Millisecond)
+
+	s := p.Snapshot()
+	assert.Equal(t, uint16(150), s.FilterResource)
+	assert.Equal(t, int16(120), s.FilterDaysLeft)
+	assert.Equal(t, int16(20), s.FilterPct, "hot-tier filter_clog must survive slow merges")
+}
+
+func TestMergeSlow_FilterFieldsGatedOnFilterPolledAt(t *testing.T) {
+	t.Parallel()
+
+	prevAt := time.Unix(100, 0)
+	newAt := time.Unix(200, 0)
+	prev := entity.Snapshot{FilterResource: 150, FilterDaysLeft: 120, FilterPolledAt: prevAt, DeviceID: 1}
+
+	t.Run("partial without filter read keeps prev", func(t *testing.T) {
+		t.Parallel()
+		got := service.MergeSlowForTest(prev, entity.Snapshot{DeviceID: 2, PolledAt: newAt})
+		assert.Equal(t, uint16(2), got.DeviceID, "mandatory slow fields still merge")
+		assert.Equal(t, uint16(150), got.FilterResource)
+		assert.Equal(t, int16(120), got.FilterDaysLeft)
+		assert.Equal(t, prevAt, got.FilterPolledAt)
+	})
+
+	t.Run("partial with filter read overwrites", func(t *testing.T) {
+		t.Parallel()
+		got := service.MergeSlowForTest(prev, entity.Snapshot{
+			DeviceID: 2, FilterResource: 180, FilterDaysLeft: -3, FilterPolledAt: newAt, PolledAt: newAt,
+		})
+		assert.Equal(t, uint16(180), got.FilterResource)
+		assert.Equal(t, int16(-3), got.FilterDaysLeft)
+		assert.Equal(t, newAt, got.FilterPolledAt)
+	})
+
+	t.Run("never read stays zero", func(t *testing.T) {
+		t.Parallel()
+		got := service.MergeSlowForTest(entity.Snapshot{}, entity.Snapshot{DeviceID: 2, PolledAt: newAt})
+		assert.True(t, got.FilterPolledAt.IsZero())
+		assert.Zero(t, got.FilterDaysLeft)
+	})
+}
+
 func TestPollFailure_DoesNotNotifySubscribers(t *testing.T) {
 	t.Parallel()
 

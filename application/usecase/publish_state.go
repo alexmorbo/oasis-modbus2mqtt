@@ -32,8 +32,8 @@ type stateMsg struct {
 // and publishes every message retained on every Apply. Idempotent publishes
 // are cheap and let any reconnecting subscriber recover the current value
 // from the broker instead of waiting for the next change. A single Apply call
-// emits all 19 messages; per-topic publish errors are aggregated via
-// errors.Join.
+// emits up to 21 messages (19 until the best-effort filter registers have
+// been read once); per-topic publish errors are aggregated via errors.Join.
 type PublishState struct {
 	publisher Publisher
 	topics    Topics
@@ -60,8 +60,11 @@ func NewPublishState(pub Publisher, topics Topics, logger *slog.Logger) *Publish
 	}
 }
 
-// Apply publishes every state message for snap with retained=true. All 19
+// Apply publishes every state message for snap with retained=true. Up to 21
 // messages are sent on every call — there is no payload-level dedup. The
+// filter_days_left and filter_resource messages are omitted while
+// snap.FilterPolledAt is zero, so HA keeps them "unknown" instead of
+// recording a bogus 0 before the slow tier has read them. The
 // retained flag means a late or reconnecting subscriber (HA restart, MQTT
 // integration reload, broker blip) recovers the current value from the
 // broker instead of staying at "unknown" until the underlying register
@@ -93,10 +96,11 @@ func (p *PublishState) Apply(ctx context.Context, snap entity.Snapshot) error {
 	return nil
 }
 
-// buildMessages returns the full ordered list of state messages for snap. Pure
-// function: no I/O, no goroutines, deterministic ordering for stable tests.
+// buildMessages returns the ordered list of state messages for snap (21, or
+// 19 without the filter pair). Pure function: no I/O, no goroutines,
+// deterministic ordering for stable tests.
 func (p *PublishState) buildMessages(snap entity.Snapshot) []stateMsg {
-	return []stateMsg{
+	msgs := []stateMsg{
 		{
 			topic:    p.topics.State("supply_temperature"),
 			payload:  []byte(formatTemperature(snap.SupplyTemp)),
@@ -142,6 +146,22 @@ func (p *PublishState) buildMessages(snap entity.Snapshot) []stateMsg {
 			payload:  fmt.Appendf(nil, "0x%04X", snap.DeviceID),
 			objectID: "device_id",
 		},
+	}
+	if !snap.FilterPolledAt.IsZero() {
+		msgs = append(msgs,
+			stateMsg{
+				topic:    p.topics.State("filter_days_left"),
+				payload:  []byte(strconv.FormatInt(int64(snap.FilterDaysLeft), 10)),
+				objectID: "filter_days_left",
+			},
+			stateMsg{
+				topic:    p.topics.State("filter_resource"),
+				payload:  []byte(strconv.FormatUint(uint64(snap.FilterResource), 10)),
+				objectID: "filter_resource",
+			},
+		)
+	}
+	return append(msgs, []stateMsg{
 		{
 			topic:    p.topics.State("operation_time_left"),
 			payload:  []byte(strconv.Itoa(int(snap.OperationTimeLeft.Seconds()))),
@@ -192,7 +212,7 @@ func (p *PublishState) buildMessages(snap entity.Snapshot) []stateMsg {
 			payload:  []byte(hvacAction(snap)),
 			objectID: "hvac_action",
 		},
-	}
+	}...)
 }
 
 // formatTemperature renders t with exactly one decimal place. A zero-value

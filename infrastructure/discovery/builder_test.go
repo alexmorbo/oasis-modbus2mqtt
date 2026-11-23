@@ -88,11 +88,9 @@ func TestNewBuilder_NilLogger_FallsBackToDefault(t *testing.T) {
 func TestBuild_Count(t *testing.T) {
 	t.Parallel()
 	out := buildAll(t)
-	// Catalog has 11 entities with Hint.Kind != None (10 sensors + 1 switch),
-	// plus 1 climate + 3 binary_sensors = 15 expected. Use GreaterOrEqual to
-	// stay tolerant of future catalog additions.
-	assert.GreaterOrEqual(t, len(out), 13)
-	assert.LessOrEqual(t, len(out), 32)
+	// Catalog has 13 entities with Hint.Kind != None (12 sensors + 1 switch),
+	// plus 1 climate + 3 binary_sensors + 1 derived current_operation sensor.
+	assert.Len(t, out, 18)
 }
 
 func TestBuild_TopicsAreCorrect(t *testing.T) {
@@ -325,8 +323,8 @@ func TestBuild_SensorCount(t *testing.T) {
 			binSensors++
 		}
 	}
-	// 10 sensors from catalog, 1 switch, 1 climate, 3 binary_sensors.
-	assert.GreaterOrEqual(t, sensors, 8)
+	// 12 sensors from catalog + derived current_operation, 1 switch, 1 climate, 3 binary_sensors.
+	assert.Equal(t, 13, sensors)
 	assert.Equal(t, 1, switches)
 	assert.Equal(t, 1, climates)
 	assert.Equal(t, 3, binSensors)
@@ -466,4 +464,45 @@ func TestBuilder_AllPayloadTypes(t *testing.T) {
 	assert.True(t, hasSwitch, "at least one switch expected")
 	assert.True(t, hasClimate, "climate entity expected")
 	assert.True(t, hasBinarySensor, "at least one binary_sensor expected")
+}
+
+func TestBuild_FilterDaysSensors(t *testing.T) {
+	t.Parallel()
+	out := buildAll(t)
+
+	tests := []struct {
+		objectID     string
+		name         string
+		stateClass   any
+		wantCategory any
+	}{
+		{objectID: "filter_days_left", name: "Filter days left", stateClass: "measurement", wantCategory: nil},
+		{objectID: "filter_resource", name: "Filter resource", stateClass: nil, wantCategory: "diagnostic"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.objectID, func(t *testing.T) {
+			t.Parallel()
+			topic := "homeassistant/sensor/oasis_syberia/" + tc.objectID + "/config"
+			var found *discovery.Discovery
+			for i := range out {
+				if out[i].Topic == topic {
+					found = &out[i]
+				}
+			}
+			require.NotNilf(t, found, "discovery topic %s not built", topic)
+
+			m := unmarshalMap(t, found.Payload)
+			assert.Equal(t, tc.name, m["name"])
+			assert.Equal(t, "oasis_syberia_"+tc.objectID, m["unique_id"])
+			assert.Equal(t, "oasis_syberia/state/"+tc.objectID, m["state_topic"])
+			assert.Equal(t, "duration", m["device_class"])
+			assert.Equal(t, "d", m["unit_of_measurement"])
+			assert.Equal(t, "mdi:air-filter", m["icon"])
+			assert.Equal(t, tc.stateClass, m["state_class"])
+			assert.Equal(t, tc.wantCategory, m["entity_category"])
+			_, hasCmd := m["command_topic"]
+			assert.False(t, hasCmd, "filter sensors are read-only")
+		})
+	}
 }

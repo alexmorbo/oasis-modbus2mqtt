@@ -45,10 +45,10 @@ const availMgrShutdownTimeout = 2 * time.Second
 // during graceful shutdown so in-flight publishes can drain.
 const mqttDisconnectQuiesce = 500 * time.Millisecond
 
-// haOnlineRepublishTimeout bounds the discovery+state republish triggered
-// by an HA "online" birth message. It is generous because a republish
-// fan-out is 13 discovery configs + 19 state messages.
-const haOnlineRepublishTimeout = 10 * time.Second
+// republishTimeout bounds one discovery+state republish, triggered
+// by an MQTT (re)connect or an HA "online" birth message. The fan-out is 18
+// discovery configs + 21 state messages.
+const republishTimeout = 10 * time.Second
 
 // App is the wired application root. It owns every long-lived component
 // constructed at boot and orchestrates startup and graceful shutdown via
@@ -113,29 +113,18 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 
 	cmdSub := intmqtt.NewCommandSubscriber(mqttClient, applyCmd, topics, logger)
 
+	republish := newRepublisher(poller, pubDiscovery, pubState, logger)
+
 	haStatusTopic := cfg.HomeAssistant.DiscoveryPrefix + "/status"
 	haStatus := service.NewHAStatusListener(
 		mqttClient,
 		haStatusTopic,
-		func(ctx context.Context) {
-			snap := poller.Snapshot()
-			firmware := "unknown"
-			if !snap.PolledAt.IsZero() {
-				firmware = snap.Firmware.String()
-			}
-			if err := pubDiscovery.Publish(ctx, firmware); err != nil {
-				logger.Warn("ha online: discovery republish failed", "error", err)
-			}
-			if snap.PolledAt.IsZero() {
-				logger.Info("ha online: skipping state republish (no snapshot yet)")
-				return
-			}
-			if err := pubState.Apply(ctx, snap); err != nil {
-				logger.Warn("ha online: state republish failed", "error", err)
-			}
-		},
+		func(ctx context.Context) { republish(ctx, "ha online") },
 		logger,
 	)
+
+	// Runs on the initial connect too, so Run does not publish discovery itself.
+	mqttClient.AddOnConnectHook(func(ctx context.Context) { republish(ctx, "mqtt connected") })
 
 	health := inthandler.NewHealth(mqttClient, poller, readinessThreshold, clock, logger)
 	metricsHandler := inthandler.NewMetrics()
@@ -167,8 +156,6 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 		},
 	)
 
-	_ = haOnlineRepublishTimeout // referenced by future explicit-timeout wiring
-
 	return &App{
 		cfg:          cfg,
 		logger:       logger,
@@ -190,9 +177,10 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 	}, nil
 }
 
-// Run boots the application: connects Modbus and MQTT, publishes initial HA
-// discovery, starts the command subscriber and HA status listener, launches
-// the poll/availability goroutines, and serves HTTP. It blocks until ctx is
+// Run boots the application: connects Modbus and MQTT (the on-connect hook
+// publishes HA discovery, on every reconnect as well), starts the command
+// subscriber and HA status listener, launches the poll/availability
+// goroutines, and serves HTTP. It blocks until ctx is
 // cancelled or the HTTP server exits with an error, then performs the
 // graceful shutdown sequence before returning.
 func (a *App) Run(ctx context.Context) error {
@@ -205,10 +193,6 @@ func (a *App) Run(ctx context.Context) error {
 
 	if err := a.mqttClient.Connect(runCtx); err != nil {
 		return fmt.Errorf("mqtt initial connect: %w", err)
-	}
-
-	if err := a.pubDiscovery.Publish(runCtx, "unknown"); err != nil {
-		a.logger.Warn("initial discovery publish failed", "error", err)
 	}
 
 	if err := a.cmdSub.Start(runCtx); err != nil {
@@ -277,4 +261,47 @@ func (a *App) shutdown() {
 	}
 
 	a.logger.Info("shutdown complete")
+}
+
+type snapshotSource interface {
+	Snapshot() entity.Snapshot
+}
+
+type discoveryPublisher interface {
+	Publish(ctx context.Context, firmware string) error
+}
+
+type statePublisher interface {
+	Apply(ctx context.Context, snap entity.Snapshot) error
+}
+
+// newRepublisher returns the single discovery+state republish shared by the
+// MQTT on-connect hook and the HA birth listener. Discovery always goes out
+// (firmware "unknown" until the first poll); state only once a snapshot exists.
+func newRepublisher(
+	snaps snapshotSource,
+	disc discoveryPublisher,
+	state statePublisher,
+	logger *slog.Logger,
+) func(ctx context.Context, trigger string) {
+	return func(parent context.Context, trigger string) {
+		ctx, cancel := context.WithTimeout(parent, republishTimeout)
+		defer cancel()
+
+		snap := snaps.Snapshot()
+		firmware := "unknown"
+		if !snap.PolledAt.IsZero() {
+			firmware = snap.Firmware.String()
+		}
+		if err := disc.Publish(ctx, firmware); err != nil {
+			logger.Warn("discovery republish failed", "trigger", trigger, "error", err)
+		}
+		if snap.PolledAt.IsZero() {
+			logger.Info("skipping state republish (no snapshot yet)", "trigger", trigger)
+			return
+		}
+		if err := state.Apply(ctx, snap); err != nil {
+			logger.Warn("state republish failed", "trigger", trigger, "error", err)
+		}
+	}
 }

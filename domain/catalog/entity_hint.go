@@ -84,6 +84,8 @@ const (
 	DeviceClassRunning DeviceClass = "running"
 	// DeviceClassPower is the HA "power" device_class.
 	DeviceClassPower DeviceClass = "power"
+	// DeviceClassDuration is the HA "duration" sensor device_class.
+	DeviceClassDuration DeviceClass = "duration"
 )
 
 // StateClass is a typed string of the HA sensor state_class attribute.

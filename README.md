@@ -28,8 +28,9 @@ Running in production on the author's homelab against a real GTC Oasis Syberia 5
 
 - Maintains exactly **one** Modbus TCP connection to the controller (the device refuses concurrent clients).
 - Polls registers on a tiered schedule (5 s / 15 s / 60 s) and decodes them into a typed `Snapshot`.
-- Publishes `homeassistant/.../config` MQTT discovery for ~16 entities — climate, power switch, supply/room temperature, room humidity, supply/exhaust fan speed, filter clog %, heat demand, current operation, firmware, device id, plus heater-active / damper-open / problem binary sensors.
+- Publishes `homeassistant/.../config` MQTT discovery for 18 entities — climate, power switch, supply/room temperature, room humidity, supply/exhaust fan speed, filter clog %, filter days left / filter resource, heat demand, current operation, firmware, device id, plus heater-active / damper-open / problem binary sensors.
 - Subscribes to HA command topics (`cmd/power`, `cmd/hvac_mode`, `cmd/target_temperature`, `cmd/fan_target`) and translates them to Modbus writes — including the **edge sequence** required by `Power_Dev` and the **read-modify-write** required by `Dev_Keys_2`.
+- Republishes discovery (and the current state, once polled) on every MQTT (re)connect and on every HA birth message, so entities come back after a broker restart without persistence.
 - Holds an automatic reconnect supervisor with exponential backoff + jitter for both Modbus and MQTT, surfaces `availability=online/offline` (LWT-backed) so HA correctly greys-out entities when the bridge is down.
 - Refuses writes while the controller is in a transition phase (`close_damper`, `electric_calorifier_purge`, …) and exposes the current operation as a sensor so users can see *why*.
 - Ships `/health/live`, `/health/ready`, and `/metrics` (VictoriaMetrics-compatible) for k8s probes and Prometheus scraping.
@@ -119,7 +120,7 @@ All configuration is via environment variables. Defaults in parens.
 | `HA_MODEL` | `Syberia 5` | |
 | `POLL_HOT_INTERVAL` | `5s` | Tier 1: state + filter + fans + target |
 | `POLL_MEDIUM_INTERVAL` | `15s` | Tier 2: room temp/hum + extra errors + mode |
-| `POLL_SLOW_INTERVAL` | `60s` | Tier 3: firmware + device id + Type_Dev |
+| `POLL_SLOW_INTERVAL` | `60s` | Tier 3: firmware + device id + Type_Dev + filter resource / days left (h344/h346, best-effort) |
 | `AVAILABILITY_THRESHOLD` | `30s` | Stale snapshot → publish `offline` |
 | `HTTP_PORT` | `8080` | `/health/*` + `/metrics` |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
@@ -151,7 +152,9 @@ The Oasis Syberia controller permits **only one** TCP client — you cannot run 
 | `sensor.oasis_syberia_room_humidity` | sensor (%) | from wall remote |
 | `sensor.oasis_syberia_supply_fan_speed` | sensor | actual speed reported by controller |
 | `sensor.oasis_syberia_exhaust_fan_speed` | sensor | actual exhaust speed |
-| `sensor.oasis_syberia_filter_clog` | sensor (%) | filter wear from controller's pressure sensor |
+| `sensor.oasis_syberia_filter_clog` | sensor (%) | calendar filter wear, not a pressure sensor: `(h344 − h346) / h344` |
+| `sensor.oasis_syberia_filter_days_left` | sensor (d) | days of filter resource remaining (h346, signed: negative when overdue); resets to the configured resource on a panel filter reset. Read-only over Modbus. `unknown` until the first successful slow-tier poll |
+| `sensor.oasis_syberia_filter_resource` | sensor (d, diagnostic) | configured filter resource (h344). `unknown` until the first successful slow-tier poll |
 | `sensor.oasis_syberia_heat_demand` | sensor (%) | PID demand for heating |
 | `sensor.oasis_syberia_operation_time_left` | sensor (s) | seconds until current transition completes |
 | `sensor.oasis_syberia_current_operation` | sensor (text) | `idle` / `close_damper` / `preheat_calorifier` / … |
@@ -181,6 +184,7 @@ The controller has several quirks the bridge handles for you:
 - **Power_Dev (h2) is edge-triggered** — turning OFF requires `write 1 → wait ≥100 ms → write 0`; turning ON is a single `write 1`. The register always reads back as 0.
 - **Dev_Keys_2 (h86) needs RMW** — bits 0..1 are mode; bits 2..15 carry timer/humidifier/CO₂ settings that must be preserved.
 - **TCP idle timeout ~5–10 s** — the bridge's hot-tier 5 s poll doubles as a keepalive.
+- **Filter counter is read-only over Modbus** — h346 (days left) acknowledges FC06/FC16 writes and ignores them, so the filter reset is only possible from the panel; the bridge exposes no reset button.
 - **Transition states are not writeable** — during `close_damper` / `electric_calorifier_purge` / `preheat_calorifier` the controller acknowledges writes but ignores them. The bridge rejects commands with a clear error during these phases; the `current_operation` sensor surfaces the reason in HA.
 
 If your Oasis variant has different register addresses, edit `domain/catalog/registers.go` and the bit catalog in `domain/entity/error_code.go`.

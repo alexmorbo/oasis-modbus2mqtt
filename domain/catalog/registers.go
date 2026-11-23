@@ -85,7 +85,7 @@ var Registers = []RegisterDef{
 			Kind: EntityKindSensor, ObjectID: "filter_clog", Name: "Filter clog",
 			Unit: "%", StateClass: StateClassMeasurement, Icon: "mdi:air-filter",
 		},
-		Description: "filter1 clog percentage",
+		Description: "filter1 calendar wear percentage, (h344-h346)/h344; not a pressure sensor",
 	},
 	{
 		Addr: 16, Kind: valueobject.RegisterKindInput, Name: "DOutputs",
@@ -157,6 +157,27 @@ var Registers = []RegisterDef{
 		Addr: 0, Kind: valueobject.RegisterKindHolding, Name: "Type_Dev",
 		Group:       PollGroupSlow,
 		Description: "device configuration: heater (0..3), cooler (4..7), recuperator (8..11)",
+	},
+	{
+		Addr: 344, Kind: valueobject.RegisterKindHolding, Name: "Filtr1_Resurs",
+		Group: PollGroupSlow,
+		Hint: EntityHint{
+			Kind: EntityKindSensor, ObjectID: "filter_resource", Name: "Filter resource",
+			DeviceClass: DeviceClassDuration, Unit: "d",
+			Category: EntityCategoryDiagnostic, Icon: "mdi:air-filter",
+		},
+		Description: "undocumented: configured filter1 resource in days",
+	},
+	{
+		Addr: 346, Kind: valueobject.RegisterKindHolding, Name: "Filtr1_Ostatok",
+		Group: PollGroupSlow,
+		Hint: EntityHint{
+			Kind: EntityKindSensor, ObjectID: "filter_days_left", Name: "Filter days left",
+			DeviceClass: DeviceClassDuration, Unit: "d",
+			StateClass: StateClassMeasurement, Icon: "mdi:air-filter",
+		},
+		Description: "undocumented: filter1 resource remaining in days, counts down daily, " +
+			"reset to h344 from the panel; read-only over Modbus (writes are acked and ignored)",
 	},
 
 	// --- Holding registers, hot tier ---

@@ -130,3 +130,27 @@ func subscribeAndCollect(t *testing.T, client paho.Client, topic string) func() 
 		return out
 	}
 }
+
+// subscribeAndRecordAll subscribes to a single topic and records every
+// payload received, in order, so a test can assert a value never appeared.
+func subscribeAndRecordAll(t *testing.T, client paho.Client, topic string) func() []string {
+	t.Helper()
+	var (
+		mu       sync.Mutex
+		payloads []string
+	)
+
+	tok := client.Subscribe(topic, 1, func(_ paho.Client, msg paho.Message) {
+		mu.Lock()
+		defer mu.Unlock()
+		payloads = append(payloads, string(msg.Payload()))
+	})
+	require.True(t, tok.WaitTimeout(5*time.Second))
+	require.NoError(t, tok.Error())
+
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), payloads...)
+	}
+}

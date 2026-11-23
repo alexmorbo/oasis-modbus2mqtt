@@ -34,7 +34,7 @@ func newReq(t *testing.T, path string) (*httptest.ResponseRecorder, *gin.Context
 	t.Helper()
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(http.MethodGet, path, nil)
+	c.Request = httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
 	return w, c
 }
 
