@@ -1,6 +1,9 @@
 ---
 title: "Feature: Filter days-left sensors and MQTT on-connect discovery race fix"
-status: review
+status: shipped
+commit_sha: fd052b6
+release: v0.1.2
+deployed: 2026-11-23 (delta, terragrunt oasis-mqtt-bridge)
 priority: high
 complexity: 5
 created: 2026-11-23
@@ -248,3 +251,11 @@ ok  .../tests/e2e   17.902s
 - Two pre-existing `noctx` lint findings in `interface/http/handler/*_test.go`
   are fixed (`httptest.NewRequestWithContext`). Local golangci-lint v2.12
   reports them; the CI pin v2.5 does not.
+
+## Live verification (2026-11-23, delta, v0.1.2)
+
+- Pod start log: one `discovery published count=18`, no `mqtt publisher not connected` warnings. `state published count=21`.
+- HA: `sensor.oasis_syberia_filter_days_left` = 150 d (duration, measurement) and `sensor.oasis_syberia_filter_resource` = 150 d (diagnostic) appeared without restarting HA.
+- HA created them with an area prefix (`sensor.koridor_oasis_syberia_*`, because the device is in the "Коридор" area). They were renamed in the registry to the `sensor.oasis_syberia_*` form. Follow-up: send `default_entity_id` in discovery payloads so new entities get stable ids.
+- Startup log still reports `version: 0.1.0` (pre-existing: version is not injected at build time).
+
