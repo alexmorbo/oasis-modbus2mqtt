@@ -13,6 +13,9 @@ import (
 	"github.com/alexmorbo/oasis-modbus2mqtt/internal/app"
 )
 
+// version is injected at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -22,7 +25,7 @@ func main() {
 
 	log := logger.New(cfg.Logger)
 	slog.SetDefault(log)
-	log.Info("oasis-modbus2mqtt starting", "version", "0.1.0")
+	log.Info("oasis-modbus2mqtt starting", "version", version)
 
 	metrics.Init()
 

@@ -19,20 +19,22 @@ import (
 )
 
 type fakeDispatcher struct {
-	inputResp   map[string][]uint16
-	holdingResp map[string][]uint16
-	inputErr    map[string]error
-	holdingErr  map[string]error
-	inputCalls  int
-	holdCalls   int
+	inputResp    map[string][]uint16
+	holdingResp  map[string][]uint16
+	inputErr     map[string]error
+	holdingErr   map[string]error
+	inputCalls   int
+	holdCalls    int
+	holdCallsFor map[string]int
 }
 
 func newFakeDispatcher() *fakeDispatcher {
 	return &fakeDispatcher{
-		inputResp:   make(map[string][]uint16),
-		holdingResp: make(map[string][]uint16),
-		inputErr:    make(map[string]error),
-		holdingErr:  make(map[string]error),
+		inputResp:    make(map[string][]uint16),
+		holdingResp:  make(map[string][]uint16),
+		inputErr:     make(map[string]error),
+		holdingErr:   make(map[string]error),
+		holdCallsFor: make(map[string]int),
 	}
 }
 
@@ -53,6 +55,7 @@ func (f *fakeDispatcher) ReadInput(_ context.Context, start, count uint16) ([]ui
 func (f *fakeDispatcher) ReadHolding(_ context.Context, start, count uint16) ([]uint16, error) {
 	f.holdCalls++
 	k := key(start, count)
+	f.holdCallsFor[k]++
 	if err := f.holdingErr[k]; err != nil {
 		return nil, err
 	}
@@ -331,12 +334,15 @@ func TestPollSlow_DecodesAllFields(t *testing.T) {
 	d.holdingResp[key(0, 1)] = []uint16{0x0121} // heater=1, cooler=2, recup=1
 	d.holdingResp[key(344, 1)] = []uint16{150}  // filter resource, days
 	d.holdingResp[key(346, 1)] = []uint16{120}  // filter days left
+	presetSettingsSpans(d)
 
 	clk := fakeClock{now: time.Date(2026, 4, 25, 14, 0, 0, 0, time.UTC)}
 	pc := usecase.NewPollController(d, clk, nil)
 
 	snap, err := pc.PollSlow(context.Background())
 	require.NoError(t, err)
+	assert.Equal(t, livePanelSettings, snap.Settings)
+	assert.Equal(t, clk.now, snap.SettingsPolledAt)
 	assert.Equal(t, "v5.2.1", snap.Firmware.String())
 	assert.Equal(t, uint16(0x4242), snap.DeviceID)
 	assert.Equal(t, entity.HeaterElectric, snap.DeviceConfig.Heater)
@@ -346,7 +352,7 @@ func TestPollSlow_DecodesAllFields(t *testing.T) {
 	assert.Equal(t, int16(120), snap.FilterDaysLeft)
 	assert.Equal(t, clk.now, snap.PolledAt)
 	assert.Equal(t, clk.now, snap.FilterPolledAt, "both filter reads succeeded")
-	assert.Equal(t, 3, d.holdCalls, "h0, h344 and h346 are separate single-register reads")
+	assert.Equal(t, 5, d.holdCalls, "h0, the two settings spans, h344 and h346")
 }
 
 func TestPollSlow_FilterDaysLeftSigned(t *testing.T) {
@@ -422,6 +428,7 @@ func TestPollSlow_FilterReadsBestEffort(t *testing.T) {
 			d.inputResp[key(0, 1)] = []uint16{0x5210}
 			d.inputResp[key(79, 1)] = []uint16{0x4242}
 			d.holdingResp[key(0, 1)] = []uint16{0x0121}
+			presetSettingsSpans(d)
 			tc.setup(d)
 
 			var buf bytes.Buffer
@@ -438,11 +445,125 @@ func TestPollSlow_FilterReadsBestEffort(t *testing.T) {
 			assert.True(t, snap.FilterPolledAt.IsZero())
 			assert.Zero(t, snap.FilterResource)
 			assert.Zero(t, snap.FilterDaysLeft)
-			assert.Equal(t, tc.wantHolds, d.holdCalls)
+			assert.Equal(t, tc.wantHolds+2, d.holdCalls, "plus the two settings spans")
+			assert.Equal(t, livePanelSettings, snap.Settings, "settings survive a failed filter read")
 
 			out := buf.String()
 			assert.Equal(t, 1, strings.Count(out, "level=WARN"), "exactly one warn per failed filter read")
 			assert.Contains(t, out, "register="+tc.wantRegister)
+		})
+	}
+}
+
+// livePanelSettings mirrors the 2026-11-23 live dump.
+var livePanelSettings = entity.PanelSettings{
+	UserKeys0: 0x07E4, DarkBrightness: 20, IRRemoteTime: 3, UserDev0: 0x0004,
+	HumidityTarget: 50, CO2Target: 500,
+}
+
+func presetSettingsSpans(d *fakeDispatcher) {
+	d.holdingResp[key(22, 4)] = []uint16{0x07E4, 20, 3, 0x0004}
+	d.holdingResp[key(35, 2)] = []uint16{50, 500}
+}
+
+func presetSlowMandatory(d *fakeDispatcher) {
+	d.inputResp[key(0, 1)] = []uint16{0x5210}
+	d.inputResp[key(79, 1)] = []uint16{0x4242}
+	d.holdingResp[key(0, 1)] = []uint16{0x0121}
+	d.holdingResp[key(344, 1)] = []uint16{150}
+	d.holdingResp[key(346, 1)] = []uint16{120}
+}
+
+func TestPollSlow_SettingsSpans(t *testing.T) {
+	t.Parallel()
+
+	d := newFakeDispatcher()
+	presetSlowMandatory(d)
+	presetSettingsSpans(d)
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	clk := fakeClock{now: time.Date(2026, 11, 23, 10, 0, 0, 0, time.UTC)}
+	pc := usecase.NewPollController(d, clk, logger)
+
+	snap, err := pc.PollSlow(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, livePanelSettings, snap.Settings)
+	assert.Equal(t, clk.now, snap.SettingsPolledAt)
+	assert.Equal(t, 1, d.holdCallsFor[key(22, 4)], "one ReadHolding(22,4) span")
+	assert.Equal(t, 1, d.holdCallsFor[key(35, 2)], "one ReadHolding(35,2) span")
+	allowed := []string{key(0, 1), key(22, 4), key(35, 2), key(344, 1), key(346, 1)}
+	for k := range d.holdCallsFor {
+		assert.Contains(t, allowed, k, "only documented spans are read; h26..h34 never")
+	}
+	assert.NotContains(t, buf.String(), "level=WARN")
+}
+
+func TestPollSlow_SettingsReadBestEffort(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		setup      func(d *fakeDispatcher)
+		wantSpan   string
+		wantSecond bool
+	}{
+		{
+			name:     "first span error",
+			setup:    func(d *fakeDispatcher) { d.holdingErr[key(22, 4)] = errFakeRead },
+			wantSpan: "h22..h25",
+		},
+		{
+			name:     "first span short",
+			setup:    func(d *fakeDispatcher) { d.holdingResp[key(22, 4)] = []uint16{1, 2, 3} },
+			wantSpan: "h22..h25",
+		},
+		{
+			name:       "second span error",
+			setup:      func(d *fakeDispatcher) { d.holdingErr[key(35, 2)] = errFakeRead },
+			wantSpan:   "h35..h36",
+			wantSecond: true,
+		},
+		{
+			name:       "second span short",
+			setup:      func(d *fakeDispatcher) { d.holdingResp[key(35, 2)] = []uint16{50} },
+			wantSpan:   "h35..h36",
+			wantSecond: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := newFakeDispatcher()
+			presetSlowMandatory(d)
+			presetSettingsSpans(d)
+			tc.setup(d)
+
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			clk := fakeClock{now: time.Date(2026, 11, 23, 10, 0, 0, 0, time.UTC)}
+			pc := usecase.NewPollController(d, clk, logger)
+
+			snap, err := pc.PollSlow(context.Background())
+			require.NoError(t, err)
+			assert.Equal(t, "v5.2.1", snap.Firmware.String())
+			assert.Equal(t, uint16(0x4242), snap.DeviceID)
+			assert.Equal(t, entity.HeaterElectric, snap.DeviceConfig.Heater)
+			assert.Equal(t, int16(120), snap.FilterDaysLeft, "filter still read after a settings failure")
+			assert.Equal(t, clk.now, snap.FilterPolledAt)
+			assert.True(t, snap.SettingsPolledAt.IsZero())
+			assert.Equal(t, entity.PanelSettings{}, snap.Settings)
+			if tc.wantSecond {
+				assert.Equal(t, 1, d.holdCallsFor[key(35, 2)])
+			} else {
+				assert.Zero(t, d.holdCallsFor[key(35, 2)], "second span must not be read after the first fails")
+			}
+
+			out := buf.String()
+			assert.Equal(t, 1, strings.Count(out, "level=WARN"))
+			assert.Contains(t, out, "poll_slow settings read failed")
+			assert.Contains(t, out, "register="+tc.wantSpan)
 		})
 	}
 }

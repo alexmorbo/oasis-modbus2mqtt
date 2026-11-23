@@ -37,9 +37,11 @@ type SnapshotMerger interface {
 	MergeSlow(prev, partial entity.Snapshot) entity.Snapshot
 }
 
-// SnapshotSubscriber is invoked once per successful poll-and-merge. The
-// callback runs synchronously inside the tier goroutine; it MUST NOT block
-// or another tier's poll cadence will be delayed.
+// SnapshotSubscriber is invoked once per successful poll-and-merge and once
+// per MergeSettingRegister. The callback runs synchronously inside the tier
+// goroutine (or the caller of MergeSettingRegister) and may run concurrently
+// from several of them; it MUST NOT block or another tier's poll cadence will
+// be delayed.
 type SnapshotSubscriber func(s entity.Snapshot)
 
 // PollerConfig declares the per-tier tick intervals.
@@ -62,6 +64,9 @@ type Poller struct {
 
 	mu     sync.RWMutex
 	latest entity.Snapshot
+	// settingsGen is bumped by every MergeSettingRegister. A tier poll that
+	// started under an older generation must not merge its settings read.
+	settingsGen uint64
 
 	subMu       sync.Mutex
 	subscribers []SnapshotSubscriber
@@ -169,6 +174,9 @@ func (p *Poller) doPoll(
 ) {
 	start := p.clock.Now()
 	p.logger.Debug("tier poll start", slog.String("tier", tier))
+	p.mu.RLock()
+	gen := p.settingsGen
+	p.mu.RUnlock()
 	partial, err := fn(ctx)
 	if err != nil {
 		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
@@ -183,10 +191,45 @@ func (p *Poller) doPoll(
 	}
 
 	p.mu.Lock()
+	if p.settingsGen != gen {
+		// A settings write was read back while this poll was in flight; its
+		// settings read may predate the write, so keep the read-back value.
+		partial.SettingsPolledAt = time.Time{}
+	}
 	p.latest = mergeFn(p.latest, partial)
 	merged := p.latest
 	p.mu.Unlock()
 
+	p.notify(merged)
+
+	metrics.PollDurationSeconds(tier).UpdateDuration(start)
+	metrics.SetLastSuccessfulPoll(p.clock.Now())
+}
+
+// MergeSettingRegister merges a freshly read-back settings register into the latest
+// snapshot and fans the merged snapshot out to subscribers, exactly like a tier merge.
+// It returns false (no merge, no fan-out) before the first successful settings read.
+func (p *Poller) MergeSettingRegister(addr, value uint16) bool {
+	p.mu.Lock()
+	p.settingsGen++
+	if p.latest.SettingsPolledAt.IsZero() {
+		p.mu.Unlock()
+		return false
+	}
+	next, ok := p.latest.Settings.WithRegister(addr, value)
+	if !ok {
+		p.mu.Unlock()
+		return false
+	}
+	p.latest.Settings = next
+	merged := p.latest
+	p.mu.Unlock()
+
+	p.notify(merged)
+	return true
+}
+
+func (p *Poller) notify(merged entity.Snapshot) {
 	p.subMu.Lock()
 	subs := make([]SnapshotSubscriber, len(p.subscribers))
 	copy(subs, p.subscribers)
@@ -194,9 +237,6 @@ func (p *Poller) doPoll(
 	for _, cb := range subs {
 		cb(merged)
 	}
-
-	metrics.PollDurationSeconds(tier).UpdateDuration(start)
-	metrics.SetLastSuccessfulPoll(p.clock.Now())
 }
 
 // defaultMerger copies tier-owned fields between Snapshot values. It is the
@@ -238,8 +278,9 @@ func (defaultMerger) MergeMedium(prev, partial entity.Snapshot) entity.Snapshot 
 }
 
 // MergeSlow copies the slow-tier fields from partial onto prev. The filter
-// fields are best-effort and only copied when partial carries a successful
-// filter read (non-zero FilterPolledAt); otherwise prev's values are kept.
+// and settings fields are best-effort and only copied when partial carries a
+// successful read (non-zero FilterPolledAt / SettingsPolledAt); otherwise
+// prev's values are kept.
 func (defaultMerger) MergeSlow(prev, partial entity.Snapshot) entity.Snapshot {
 	prev.Firmware = partial.Firmware
 	prev.DeviceID = partial.DeviceID
@@ -248,6 +289,10 @@ func (defaultMerger) MergeSlow(prev, partial entity.Snapshot) entity.Snapshot {
 		prev.FilterResource = partial.FilterResource
 		prev.FilterDaysLeft = partial.FilterDaysLeft
 		prev.FilterPolledAt = partial.FilterPolledAt
+	}
+	if !partial.SettingsPolledAt.IsZero() {
+		prev.Settings = partial.Settings
+		prev.SettingsPolledAt = partial.SettingsPolledAt
 	}
 	prev.PolledAt = partial.PolledAt
 	return prev

@@ -62,10 +62,32 @@ func (c SetFanCommand) String() string {
 	return fmt.Sprintf("SetFan(speed=%d)", c.FanSpeed.Value())
 }
 
+// maxLoggedSettingPayload bounds the payload echoed by SetSettingCommand.String.
+const maxLoggedSettingPayload = 32
+
+// SetSettingCommand carries a raw HA payload for a panel setting; the use case validates it.
+type SetSettingCommand struct {
+	ObjectID string
+	Payload  string
+}
+
+func (SetSettingCommand) commandTag() {}
+
+// String returns a structured-log-friendly description of the command. The
+// payload is untrusted MQTT input and is truncated to 32 bytes.
+func (c SetSettingCommand) String() string {
+	p := c.Payload
+	if len(p) > maxLoggedSettingPayload {
+		p = p[:maxLoggedSettingPayload]
+	}
+	return fmt.Sprintf("SetSetting(%s=%s)", c.ObjectID, p)
+}
+
 // Compile-time assertions that every command type satisfies Command.
 var (
 	_ Command = SetPowerCommand{}
 	_ Command = SetModeCommand{}
 	_ Command = SetTemperatureCommand{}
 	_ Command = SetFanCommand{}
+	_ Command = SetSettingCommand{}
 )

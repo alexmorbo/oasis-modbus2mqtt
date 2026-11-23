@@ -174,3 +174,19 @@ func hasExactGaugeLine(out, name string, value float64) bool {
 func gaugeValueEquals(out, name string, want float64) bool {
 	return hasExactGaugeLine(out, name, want)
 }
+
+func TestWriteNotAppliedTotal_Name(t *testing.T) {
+	metrics.Init()
+	c := metrics.WriteNotAppliedTotal("test_name_entity")
+	require.NotNil(t, c)
+	c.Inc()
+	assert.Contains(t, dump(t), `oasis_modbus_write_not_applied_total{entity="test_name_entity"} 1`)
+}
+
+func TestWriteNotAppliedRecorder_Increments(t *testing.T) {
+	metrics.Init()
+	before := metrics.WriteNotAppliedTotal("test_recorder_entity").Get()
+	metrics.WriteNotAppliedRecorder{}.WriteNotApplied("test_recorder_entity")
+	metrics.WriteNotAppliedRecorder{}.WriteNotApplied("test_recorder_entity")
+	assert.Equal(t, before+2, metrics.WriteNotAppliedTotal("test_recorder_entity").Get())
+}

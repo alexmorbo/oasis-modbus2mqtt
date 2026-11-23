@@ -1,6 +1,7 @@
 package dto_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -104,6 +105,31 @@ func TestSetFanCommand_String(t *testing.T) {
 			require.NoError(t, err)
 			cmd := dto.SetFanCommand{FanSpeed: fan}
 			assert.Equal(t, tc.want, cmd.String())
+		})
+	}
+}
+
+func TestSetSettingCommand_String(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		cmd  dto.SetSettingCommand
+		want string
+	}{
+		{name: "switch", cmd: dto.SetSettingCommand{ObjectID: "alarm_beep", Payload: "OFF"}, want: "SetSetting(alarm_beep=OFF)"},
+		{name: "number", cmd: dto.SetSettingCommand{ObjectID: "co2_target", Payload: "800"}, want: "SetSetting(co2_target=800)"},
+		{name: "empty payload", cmd: dto.SetSettingCommand{ObjectID: "x"}, want: "SetSetting(x=)"},
+		{
+			name: "long payload truncated to 32 bytes",
+			cmd:  dto.SetSettingCommand{ObjectID: "x", Payload: strings.Repeat("a", 40)},
+			want: "SetSetting(x=" + strings.Repeat("a", 32) + ")",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, tc.cmd.String())
 		})
 	}
 }

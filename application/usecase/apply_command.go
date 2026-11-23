@@ -2,11 +2,14 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/alexmorbo/oasis-modbus2mqtt/application/dto"
+	"github.com/alexmorbo/oasis-modbus2mqtt/domain/catalog"
 	"github.com/alexmorbo/oasis-modbus2mqtt/domain/entity"
 	"github.com/alexmorbo/oasis-modbus2mqtt/domain/valueobject"
 )
@@ -21,17 +24,28 @@ type CommandDispatcher interface {
 	// ModifyHolding atomically reads addr, applies modify, and writes the
 	// result back. Implementations are expected to serialize the read+write.
 	ModifyHolding(ctx context.Context, addr uint16, modify func(uint16) uint16) error
+	// ReadHolding reads count holding registers starting at start.
+	ReadHolding(ctx context.Context, start, count uint16) ([]uint16, error)
 }
 
-// SnapshotProvider returns the latest known controller snapshot. ApplyCommand
-// uses it to consult Operation for the transition-state guard before any
-// command write. *service.Poller (story 008) satisfies this interface via duck
-// typing.
-type SnapshotProvider interface {
+// SnapshotStore is the latest-snapshot view ApplyCommand needs: Snapshot for
+// the transition guard, and MergeSettingRegister to publish a read-back
+// settings register at once. *service.Poller satisfies it via duck typing.
+type SnapshotStore interface {
 	// Snapshot returns the most recent merged snapshot. The provider must be
 	// safe for concurrent calls; ApplyCommand calls Snapshot once per command.
 	Snapshot() entity.Snapshot
+	// MergeSettingRegister merges a read-back settings register and fans the
+	// snapshot out to subscribers. It returns false before the first settings read.
+	MergeSettingRegister(addr, value uint16) bool
 }
+
+// WriteNotAppliedRecorder counts writes the controller ACKed but did not apply.
+type WriteNotAppliedRecorder interface{ WriteNotApplied(objectID string) }
+
+type noopWriteNotAppliedRecorder struct{}
+
+func (noopWriteNotAppliedRecorder) WriteNotApplied(string) {}
 
 // Modbus holding-register addresses written by ApplyCommand.
 const (
@@ -56,15 +70,21 @@ const DefaultPowerOffPause = 150 * time.Millisecond
 // transition-state guard and Power_Dev edge-trigger quirks.
 type ApplyCommand struct {
 	dispatcher    CommandDispatcher
-	snapshots     SnapshotProvider
+	store         SnapshotStore
+	recorder      WriteNotAppliedRecorder
 	powerOffPause time.Duration
 	logger        *slog.Logger
+
+	// settingsMu serializes settings commands end to end (write, read-back,
+	// merge), so two toggles of one bit cannot interleave into a false mismatch.
+	settingsMu sync.Mutex
 }
 
 // NewApplyCommand constructs an ApplyCommand. A nil dispatcher or nil
-// snapshots provider is a programming error and panics. A nil logger falls
-// back to slog.Default. powerOffPause defaults to DefaultPowerOffPause.
-func NewApplyCommand(d CommandDispatcher, snaps SnapshotProvider, logger *slog.Logger) *ApplyCommand {
+// snapshot store is a programming error and panics. A nil logger falls
+// back to slog.Default. powerOffPause defaults to DefaultPowerOffPause and
+// the write-not-applied recorder to a no-op.
+func NewApplyCommand(d CommandDispatcher, snaps SnapshotStore, logger *slog.Logger) *ApplyCommand {
 	if d == nil {
 		panic("apply command: dispatcher must not be nil")
 	}
@@ -76,10 +96,21 @@ func NewApplyCommand(d CommandDispatcher, snaps SnapshotProvider, logger *slog.L
 	}
 	return &ApplyCommand{
 		dispatcher:    d,
-		snapshots:     snaps,
+		store:         snaps,
+		recorder:      noopWriteNotAppliedRecorder{},
 		powerOffPause: DefaultPowerOffPause,
 		logger:        logger,
 	}
+}
+
+// WithWriteNotAppliedRecorder sets the recorder notified when a settings
+// write is ACKed but not applied. A nil recorder restores the no-op default.
+func (a *ApplyCommand) WithWriteNotAppliedRecorder(r WriteNotAppliedRecorder) *ApplyCommand {
+	if r == nil {
+		r = noopWriteNotAppliedRecorder{}
+	}
+	a.recorder = r
+	return a
 }
 
 // WithPowerOffPause overrides the dwell between the two Power_Dev writes in
@@ -118,11 +149,18 @@ func (a *ApplyCommand) Apply(ctx context.Context, cmd dto.Command) error {
 		err = a.setTemperature(ctx, c)
 	case dto.SetFanCommand:
 		err = a.setFan(ctx, c)
+	case dto.SetSettingCommand:
+		err = a.setSetting(ctx, c)
 	default:
 		return fmt.Errorf("unknown command type %T: %w", cmd, dto.ErrInvalidPayload)
 	}
 
-	if err != nil {
+	switch {
+	case err == nil:
+	case errors.Is(err, dto.ErrWriteNotApplied):
+		// setSetting already logged one WARN with object_id, requested and actual.
+		a.logger.Debug("command failed", "command", cmdStr, "error", err)
+	default:
 		a.logger.Warn("command failed", "command", cmdStr, "error", err)
 	}
 	return err
@@ -204,11 +242,76 @@ func (a *ApplyCommand) setFan(ctx context.Context, cmd dto.SetFanCommand) error 
 	return nil
 }
 
+// setSetting validates and writes one panel setting, then reads the register
+// back and publishes the actual value. Bitfields are RMW on a fresh controller
+// read, never on the cached snapshot. A read-back that does not carry the
+// requested field returns dto.ErrWriteNotApplied: the controller can ACK a
+// write and silently ignore it (quirk §13).
+func (a *ApplyCommand) setSetting(ctx context.Context, cmd dto.SetSettingCommand) error {
+	def, ok := catalog.SettingByObjectID(cmd.ObjectID)
+	if !ok {
+		return fmt.Errorf("unknown setting %q: %w", cmd.ObjectID, dto.ErrInvalidPayload)
+	}
+	field, err := def.ParseCommand(cmd.Payload)
+	if err != nil {
+		return fmt.Errorf("%w: %w", dto.ErrInvalidPayload, err)
+	}
+	if err := a.transitionGuard(); err != nil {
+		return err
+	}
+
+	a.settingsMu.Lock()
+	defer a.settingsMu.Unlock()
+
+	// Both kinds go through ModifyHolding: a fresh read under the client
+	// mutex, and no write when the register already holds the target
+	// (h22..h36 are EEPROM-backed). The read-back below still runs so HA
+	// converges on the actual value.
+	addr := def.Addr.Uint16()
+	modify := func(cur uint16) uint16 { return def.Apply(cur, field) }
+	if !def.IsBitfield() {
+		modify = func(uint16) uint16 { return field }
+	}
+	if err := a.dispatcher.ModifyHolding(ctx, addr, modify); err != nil {
+		return fmt.Errorf("set setting %s write h%d: %w", def.ObjectID, addr, err)
+	}
+
+	regs, err := a.dispatcher.ReadHolding(ctx, addr, 1)
+	if err == nil && len(regs) != 1 {
+		err = fmt.Errorf("got %d regs: %w", len(regs), ErrUnexpectedReadLength)
+	}
+	if err != nil {
+		return fmt.Errorf("set setting %s read-back h%d: %w", def.ObjectID, addr, err)
+	}
+	actual := regs[0]
+
+	if !a.store.MergeSettingRegister(addr, actual) {
+		a.logger.Debug("setting read-back not merged: settings not yet polled",
+			"object_id", def.ObjectID, "register", fmt.Sprintf("h%d", addr))
+	}
+
+	if !def.Matches(actual, field) {
+		a.logger.Warn("setting write not applied",
+			"object_id", def.ObjectID,
+			"register", fmt.Sprintf("h%d", addr),
+			"requested", field,
+			"actual", def.Field(actual),
+			"raw", fmt.Sprintf("0x%04X", actual),
+		)
+		a.recorder.WriteNotApplied(def.ObjectID)
+		return fmt.Errorf("setting %s h%d: requested %d, read back %d: %w",
+			def.ObjectID, addr, field, def.Field(actual), dto.ErrWriteNotApplied)
+	}
+
+	a.logger.Info("setting applied", "object_id", def.ObjectID, "value", field)
+	return nil
+}
+
 // transitionGuard returns a wrapped dto.ErrTransitionInProgress when the
 // latest snapshot reports a non-idle, non-unknown operating state. Used by
 // every write path except SetPower ON (which is the recovery escape hatch).
 func (a *ApplyCommand) transitionGuard() error {
-	snap := a.snapshots.Snapshot()
+	snap := a.store.Snapshot()
 	if snap.Operation.IsTransitional() {
 		return fmt.Errorf("operation %s in progress: %w", snap.Operation, dto.ErrTransitionInProgress)
 	}

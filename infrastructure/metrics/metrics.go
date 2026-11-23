@@ -106,3 +106,18 @@ func MQTTPublishesByEntityTotal(entity string) *vm.Counter {
 		fmt.Sprintf(`oasis_mqtt_publishes_by_entity_total{entity=%q}`, entity),
 	)
 }
+
+// WriteNotAppliedTotal counts Modbus writes the controller ACKed but did not apply (read-back mismatch).
+func WriteNotAppliedTotal(entity string) *vm.Counter {
+	return vm.GetOrCreateCounter(
+		fmt.Sprintf(`oasis_modbus_write_not_applied_total{entity=%q}`, entity),
+	)
+}
+
+// WriteNotAppliedRecorder adapts WriteNotAppliedTotal to usecase.WriteNotAppliedRecorder.
+type WriteNotAppliedRecorder struct{}
+
+// WriteNotApplied increments the write-not-applied counter for objectID.
+func (WriteNotAppliedRecorder) WriteNotApplied(objectID string) {
+	WriteNotAppliedTotal(objectID).Inc()
+}

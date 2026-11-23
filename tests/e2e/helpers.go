@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -153,4 +154,22 @@ func subscribeAndRecordAll(t *testing.T, client paho.Client, topic string) func(
 		defer mu.Unlock()
 		return append([]string(nil), payloads...)
 	}
+}
+
+// lockedBuffer is a goroutine-safe log sink for asserting on bridge logs.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

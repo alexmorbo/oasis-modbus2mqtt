@@ -13,7 +13,7 @@ help:
 
 build:
 	@echo "Building binary..."
-	go build -o bin/oasis-modbus2mqtt ./cmd/server
+	go build -ldflags "-X main.version=$$(git describe --tags --always --dirty)" -o bin/oasis-modbus2mqtt ./cmd/server
 
 test:
 	@echo "Running tests..."

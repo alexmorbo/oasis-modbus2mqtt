@@ -158,6 +158,37 @@ var Registers = []RegisterDef{
 		Group:       PollGroupSlow,
 		Description: "device configuration: heater (0..3), cooler (4..7), recuperator (8..11)",
 	},
+	// Panel-menu settings. Their HA entities come from Settings, not from Hint.
+	{
+		Addr: AddrUserKeys0, Kind: valueobject.RegisterKindHolding, Name: "User_Keys_0",
+		Group:       PollGroupSlow,
+		Description: "panel menu keys bitfield (north start, sounds, auto restart, dark screen, control priority bits 13..14)",
+	},
+	{
+		Addr: AddrDarkBrightness, Kind: valueobject.RegisterKindHolding, Name: "Dark_Brightness",
+		Group:       PollGroupSlow,
+		Description: "dark-screen brightness, percent",
+	},
+	{
+		Addr: AddrIRRemoteTime, Kind: valueobject.RegisterKindHolding, Name: "IR_Remoute_Time",
+		Group:       PollGroupSlow,
+		Description: "IR remote timeout; polled only to span h22..h25 in one read",
+	},
+	{
+		Addr: AddrUserDev0, Kind: valueobject.RegisterKindHolding, Name: "User_Dev_0",
+		Group:       PollGroupSlow,
+		Description: "user device options bitfield (bit 2 = active filter)",
+	},
+	{
+		Addr: AddrHumidityTarget, Kind: valueobject.RegisterKindHolding, Name: "e_Hum_Target",
+		Group:       PollGroupSlow,
+		Description: "humidity target, percent 20..95",
+	},
+	{
+		Addr: AddrCO2Target, Kind: valueobject.RegisterKindHolding, Name: "e_Room_CO2_Target",
+		Group:       PollGroupSlow,
+		Description: "room CO2 target, ppm 500..2000",
+	},
 	{
 		Addr: 344, Kind: valueobject.RegisterKindHolding, Name: "Filtr1_Resurs",
 		Group: PollGroupSlow,

@@ -1,6 +1,6 @@
 // Package discovery builds Home Assistant MQTT discovery payloads for every
-// entity the bridge exposes (sensors, switches, climate, derived binary
-// sensors). It is pure data: no I/O, no goroutines, no global state.
+// entity the bridge exposes (sensors, switches, selects, numbers, climate,
+// derived binary sensors). It is pure data: no I/O, no goroutines, no global state.
 package discovery
 
 // DeviceInfo is the shared "device" block stamped into every HA discovery
@@ -15,12 +15,14 @@ type DeviceInfo struct {
 }
 
 // baseEntity holds the HA discovery fields common to every entity payload
-// (sensor, binary_sensor, switch, climate). It is embedded into each public
+// (sensor, binary_sensor, switch, select, number, climate). DefaultEntityID
+// replaces the object_id key current HA drops; HA uses it only when it first
+// creates the registry entry, so existing entity ids are kept. It is embedded into each public
 // payload struct and flattens automatically during json.Marshal.
 type baseEntity struct {
 	Name                string     `json:"name,omitempty"`
 	UniqueID            string     `json:"unique_id"`
-	ObjectID            string     `json:"object_id,omitempty"`
+	DefaultEntityID     string     `json:"default_entity_id"`
 	Device              DeviceInfo `json:"device"`
 	AvailabilityTopic   string     `json:"availability_topic"`
 	PayloadAvailable    string     `json:"payload_available,omitempty"`
@@ -82,4 +84,26 @@ type ClimatePayload struct {
 	FanModeStateTopic       string   `json:"fan_mode_state_topic,omitempty"`
 	FanModeCommandTopic     string   `json:"fan_mode_command_topic,omitempty"`
 	ActionTopic             string   `json:"action_topic,omitempty"`
+}
+
+// SelectPayload is the HA discovery payload for a select entity.
+type SelectPayload struct {
+	baseEntity
+	StateTopic   string   `json:"state_topic"`
+	CommandTopic string   `json:"command_topic"`
+	Options      []string `json:"options"`
+}
+
+// NumberPayload is the HA discovery payload for a number entity. Min, Max and
+// Step are always serialized: a zero min is meaningful.
+type NumberPayload struct {
+	baseEntity
+	StateTopic        string  `json:"state_topic"`
+	CommandTopic      string  `json:"command_topic"`
+	Min               float64 `json:"min"`
+	Max               float64 `json:"max"`
+	Step              float64 `json:"step"`
+	Mode              string  `json:"mode,omitempty"`
+	UnitOfMeasurement string  `json:"unit_of_measurement,omitempty"`
+	DeviceClass       string  `json:"device_class,omitempty"`
 }

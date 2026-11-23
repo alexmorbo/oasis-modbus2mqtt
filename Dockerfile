@@ -20,8 +20,9 @@ RUN if [ -f go.sum ]; then go mod download && go mod verify; fi
 
 COPY . .
 
+ARG VERSION=dev
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-w -s" -trimpath \
+    go build -ldflags="-w -s -X main.version=${VERSION}" -trimpath \
     -o /build/bin/service \
     ./cmd/server
 

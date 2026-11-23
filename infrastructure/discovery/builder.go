@@ -53,11 +53,12 @@ func NewBuilder(topics *mqtt.TopicBuilder, haCfg config.HAConfig, logger *slog.L
 }
 
 // Build produces an ordered slice of Discovery messages: every catalog
-// register with a sensor/switch hint, plus the hardcoded climate entity and
-// three derived binary sensors. firmware is stamped into device.sw_version
-// on every payload.
+// register with a sensor/switch hint, the hardcoded climate entity, three
+// derived binary sensors, the derived current_operation sensor, and one
+// config entity per catalog.Settings row. firmware is stamped into
+// device.sw_version on every payload.
 func (b *Builder) Build(firmware string) ([]Discovery, error) {
-	out := make([]Discovery, 0, 16)
+	out := make([]Discovery, 0, 32)
 
 	for _, reg := range catalog.RegistersWithEntity() {
 		switch reg.Hint.Kind {
@@ -74,7 +75,8 @@ func (b *Builder) Build(firmware string) ([]Discovery, error) {
 			}
 			out = append(out, d)
 		case catalog.EntityKindBinarySensor, catalog.EntityKindClimate,
-			catalog.EntityKindButton, catalog.EntityKindNone:
+			catalog.EntityKindButton, catalog.EntityKindSelect,
+			catalog.EntityKindNumber, catalog.EntityKindNone:
 			// Catalog currently has none of these — binary sensors and climate are
 			// hardcoded below; button/none are intentional skips.
 			b.logger.Debug("discovery: skipping unsupported catalog kind",
@@ -119,7 +121,58 @@ func (b *Builder) Build(firmware string) ([]Discovery, error) {
 	}
 	out = append(out, currentOp)
 
+	for _, def := range catalog.Settings {
+		d, err := b.buildSetting(def, firmware)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+
 	return out, nil
+}
+
+// buildSetting renders one panel setting as an entity_category=config switch,
+// select or number.
+func (b *Builder) buildSetting(def catalog.SettingDef, firmware string) (Discovery, error) {
+	hint := catalog.EntityHint{Category: catalog.EntityCategoryConfig, Icon: def.Icon}
+	stateTopic := b.topics.State(def.ObjectID)
+	cmdTopic := b.topics.Command(def.ObjectID)
+	switch def.Kind {
+	case catalog.EntityKindSwitch:
+		return b.marshal("switch", def.ObjectID, SwitchPayload{
+			baseEntity:   b.baseFor("switch", def.ObjectID, def.Name, hint, firmware),
+			StateTopic:   stateTopic,
+			CommandTopic: cmdTopic,
+			PayloadOn:    "ON",
+			PayloadOff:   "OFF",
+		})
+	case catalog.EntityKindSelect:
+		options := make([]string, 0, len(def.Options))
+		for _, o := range def.Options {
+			options = append(options, o.Label)
+		}
+		return b.marshal("select", def.ObjectID, SelectPayload{
+			baseEntity:   b.baseFor("select", def.ObjectID, def.Name, hint, firmware),
+			StateTopic:   stateTopic,
+			CommandTopic: cmdTopic,
+			Options:      options,
+		})
+	case catalog.EntityKindNumber:
+		return b.marshal("number", def.ObjectID, NumberPayload{
+			baseEntity:        b.baseFor("number", def.ObjectID, def.Name, hint, firmware),
+			StateTopic:        stateTopic,
+			CommandTopic:      cmdTopic,
+			Min:               float64(def.Min),
+			Max:               float64(def.Max),
+			Step:              float64(def.Step),
+			Mode:              string(def.Mode),
+			UnitOfMeasurement: def.Unit,
+			DeviceClass:       string(def.DeviceClass),
+		})
+	default:
+		return Discovery{}, fmt.Errorf("discovery: setting %s has unsupported kind %s", def.ObjectID, def.Kind)
+	}
 }
 
 func (b *Builder) buildDerivedSensor(
@@ -128,7 +181,7 @@ func (b *Builder) buildDerivedSensor(
 ) (Discovery, error) {
 	hint := catalog.EntityHint{Category: category, Icon: icon}
 	payload := SensorPayload{
-		baseEntity: b.baseFor(objectID, name, hint, firmware),
+		baseEntity: b.baseFor("sensor", objectID, name, hint, firmware),
 		StateTopic: b.topics.State(objectID),
 	}
 	return b.marshal("sensor", objectID, payload)
@@ -145,11 +198,14 @@ func (b *Builder) deviceInfo(firmware string) DeviceInfo {
 	}
 }
 
-func (b *Builder) baseFor(objectID, name string, hint catalog.EntityHint, firmware string) baseEntity {
+// baseFor fills the common payload fields. default_entity_id is
+// "<component>.<prefix>_<objectID>" so HA does not prefix new entity ids with
+// the device's area.
+func (b *Builder) baseFor(component, objectID, name string, hint catalog.EntityHint, firmware string) baseEntity {
 	return baseEntity{
 		Name:                name,
 		UniqueID:            b.haCfg.DevicePrefix + "_" + objectID,
-		ObjectID:            "",
+		DefaultEntityID:     component + "." + b.haCfg.DevicePrefix + "_" + objectID,
 		Device:              b.deviceInfo(firmware),
 		AvailabilityTopic:   b.topics.Availability(),
 		PayloadAvailable:    "online",
@@ -175,7 +231,7 @@ func categoryString(c catalog.EntityCategory) string {
 
 func (b *Builder) buildSensor(reg catalog.RegisterDef, firmware string) (Discovery, error) {
 	payload := SensorPayload{
-		baseEntity:                b.baseFor(reg.Hint.ObjectID, reg.Hint.Name, reg.Hint, firmware),
+		baseEntity:                b.baseFor("sensor", reg.Hint.ObjectID, reg.Hint.Name, reg.Hint, firmware),
 		StateTopic:                b.topics.State(reg.Hint.ObjectID),
 		DeviceClass:               string(reg.Hint.DeviceClass),
 		UnitOfMeasurement:         reg.Hint.Unit,
@@ -187,7 +243,7 @@ func (b *Builder) buildSensor(reg catalog.RegisterDef, firmware string) (Discove
 
 func (b *Builder) buildSwitch(reg catalog.RegisterDef, firmware string) (Discovery, error) {
 	payload := SwitchPayload{
-		baseEntity:   b.baseFor(reg.Hint.ObjectID, reg.Hint.Name, reg.Hint, firmware),
+		baseEntity:   b.baseFor("switch", reg.Hint.ObjectID, reg.Hint.Name, reg.Hint, firmware),
 		StateTopic:   b.topics.State(reg.Hint.ObjectID),
 		CommandTopic: b.topics.Command(reg.Hint.ObjectID),
 		PayloadOn:    "ON",
@@ -198,8 +254,10 @@ func (b *Builder) buildSwitch(reg catalog.RegisterDef, firmware string) (Discove
 
 func (b *Builder) buildClimate(firmware string) (Discovery, error) {
 	hint := catalog.EntityHint{Icon: "mdi:hvac"}
-	base := b.baseFor(ClimateObjectID, "", hint, firmware)
-	base.ObjectID = ClimateObjectID
+	base := b.baseFor("climate", ClimateObjectID, "", hint, firmware)
+	// The climate is the device's primary entity: climate.<prefix>, without a
+	// "_climate" stutter.
+	base.DefaultEntityID = "climate." + b.haCfg.DevicePrefix
 
 	payload := ClimatePayload{
 		baseEntity:              base,
@@ -227,7 +285,7 @@ func (b *Builder) buildBinarySensor(
 ) (Discovery, error) {
 	hint := catalog.EntityHint{Category: category, Icon: icon}
 	payload := BinarySensorPayload{
-		baseEntity:  b.baseFor(objectID, name, hint, firmware),
+		baseEntity:  b.baseFor("binary_sensor", objectID, name, hint, firmware),
 		StateTopic:  b.topics.State(objectID),
 		DeviceClass: deviceClass,
 		PayloadOn:   payloadOn,

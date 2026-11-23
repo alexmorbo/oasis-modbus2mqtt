@@ -22,6 +22,8 @@ func TestEntityKind_String(t *testing.T) {
 		{name: "switch", kind: catalog.EntityKindSwitch, want: "switch"},
 		{name: "climate", kind: catalog.EntityKindClimate, want: "climate"},
 		{name: "button", kind: catalog.EntityKindButton, want: "button"},
+		{name: "select", kind: catalog.EntityKindSelect, want: "select"},
+		{name: "number", kind: catalog.EntityKindNumber, want: "number"},
 		{name: "out of range high", kind: catalog.EntityKind(99), want: "unknown"},
 		{name: "negative", kind: catalog.EntityKind(-1), want: "unknown"},
 	}
@@ -33,6 +35,13 @@ func TestEntityKind_String(t *testing.T) {
 			assert.Equal(t, tc.want, tc.kind.String())
 		})
 	}
+}
+
+func TestEntityKind_ExistingValuesNotRenumbered(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, catalog.EntityKind(5), catalog.EntityKindButton)
+	assert.Equal(t, catalog.EntityKind(6), catalog.EntityKindSelect)
+	assert.Equal(t, catalog.EntityKind(7), catalog.EntityKindNumber)
 }
 
 func TestEntityCategory_String(t *testing.T) {
@@ -69,6 +78,7 @@ func TestDeviceClassConstants(t *testing.T) {
 	assert.Equal(t, catalog.DeviceClass("running"), catalog.DeviceClassRunning)
 	assert.Equal(t, catalog.DeviceClass("power"), catalog.DeviceClassPower)
 	assert.Equal(t, catalog.DeviceClass("duration"), catalog.DeviceClassDuration)
+	assert.Equal(t, catalog.DeviceClass("carbon_dioxide"), catalog.DeviceClassCarbonDioxide)
 }
 
 func TestStateClassConstants(t *testing.T) {

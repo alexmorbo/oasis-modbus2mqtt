@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/tbrandon/mbserver"
 
 	"github.com/alexmorbo/oasis-modbus2mqtt/infrastructure/config"
+	"github.com/alexmorbo/oasis-modbus2mqtt/infrastructure/metrics"
 	"github.com/alexmorbo/oasis-modbus2mqtt/infrastructure/modbus"
 )
 
@@ -184,6 +186,36 @@ func TestRMW_ModifyHolding_Atomic(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, uint16(0xAAAB), s.HoldingRegisters[5])
+}
+
+func TestRMW_ModifyHolding_NoOpSkipsWrite(t *testing.T) {
+	t.Parallel()
+
+	s, addr := startTestServer(t)
+	s.HoldingRegisters[22] = 0x07E4
+	var writes atomic.Int32
+	s.RegisterFunctionHandler(6, func(srv *mbserver.Server, frame mbserver.Framer) ([]byte, *mbserver.Exception) {
+		writes.Add(1)
+		return mbserver.WriteHoldingRegister(srv, frame)
+	})
+
+	c := newConnectedClient(t, addr, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	skippedBefore := metrics.ModbusOpsTotal("modify_holding_write", "skipped").Get()
+	var seen uint16
+	require.NoError(t, c.ModifyHolding(ctx, 22, func(cur uint16) uint16 {
+		seen = cur
+		return cur
+	}))
+	assert.Equal(t, uint16(0x07E4), seen, "the modify func still sees a fresh read")
+	assert.Equal(t, int32(0), writes.Load(), "an unchanged value is not written")
+	assert.GreaterOrEqual(t, metrics.ModbusOpsTotal("modify_holding_write", "skipped").Get(), skippedBefore+1)
+
+	require.NoError(t, c.ModifyHolding(ctx, 22, func(cur uint16) uint16 { return cur &^ (1 << 6) }))
+	assert.Equal(t, int32(1), writes.Load(), "a changed value is written once")
+	assert.Equal(t, uint16(0x07A4), s.HoldingRegisters[22])
 }
 
 func TestRMW_ModifyFuncPanic(t *testing.T) {

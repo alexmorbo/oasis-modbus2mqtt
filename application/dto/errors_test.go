@@ -19,6 +19,7 @@ func TestErrors_Distinct(t *testing.T) {
 		dto.ErrTransitionInProgress,
 		dto.ErrCommandTimeout,
 		dto.ErrInvalidPayload,
+		dto.ErrWriteNotApplied,
 	}
 
 	for i, a := range all {
@@ -41,6 +42,7 @@ func TestErrors_WrapPreserves(t *testing.T) {
 		dto.ErrTransitionInProgress,
 		dto.ErrCommandTimeout,
 		dto.ErrInvalidPayload,
+		dto.ErrWriteNotApplied,
 	}
 
 	for _, original := range all {

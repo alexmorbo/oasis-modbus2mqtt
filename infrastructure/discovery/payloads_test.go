@@ -184,7 +184,7 @@ func TestClimatePayload_JSONShape(t *testing.T) {
 		ActionTopic:             "oasis_syberia/state/hvac_action",
 	}
 	p.UniqueID = "oasis_syberia_climate"
-	p.ObjectID = "climate"
+	p.DefaultEntityID = "climate.oasis_syberia"
 	p.AvailabilityTopic = "oasis_syberia/availability"
 
 	m := marshalToMap(t, p)
@@ -202,7 +202,9 @@ func TestClimatePayload_JSONShape(t *testing.T) {
 	assert.Equal(t, "oasis_syberia/state/fan_target", m["fan_mode_state_topic"])
 	assert.Equal(t, "oasis_syberia/cmd/fan_target", m["fan_mode_command_topic"])
 	assert.Equal(t, "oasis_syberia/state/hvac_action", m["action_topic"])
-	assert.Equal(t, "climate", m["object_id"])
+	assert.Equal(t, "climate.oasis_syberia", m["default_entity_id"])
+	_, hasObjectID := m["object_id"]
+	assert.False(t, hasObjectID, "object_id is dropped by current HA and must not be sent")
 }
 
 func TestClimatePayload_TempStep_NotZero_Serialized(t *testing.T) {
@@ -245,6 +247,7 @@ func TestBaseEntity_OmitemptyDefaults(t *testing.T) {
 	m := marshalToMap(t, p)
 	// Must be present.
 	assert.Contains(t, m, "unique_id")
+	assert.Contains(t, m, "default_entity_id", "default_entity_id has no omitempty")
 	assert.Contains(t, m, "device")
 	assert.Contains(t, m, "availability_topic")
 	assert.Contains(t, m, "state_topic")
@@ -263,4 +266,49 @@ func TestDiscovery_StructFields(t *testing.T) {
 	d := discovery.Discovery{Topic: "homeassistant/sensor/x/y/config", Payload: []byte(`{}`)}
 	assert.Equal(t, "homeassistant/sensor/x/y/config", d.Topic)
 	assert.Equal(t, []byte(`{}`), d.Payload)
+}
+
+func TestSelectPayload_JSONShape(t *testing.T) {
+	t.Parallel()
+	p := discovery.SelectPayload{
+		StateTopic:   "oasis_syberia/state/control_priority",
+		CommandTopic: "oasis_syberia/cmd/control_priority",
+		Options:      []string{"temperature", "humidity", "co2"},
+	}
+	p.UniqueID = "oasis_syberia_control_priority"
+	p.DefaultEntityID = "select.oasis_syberia_control_priority"
+
+	m := marshalToMap(t, p)
+	assert.Equal(t, "oasis_syberia/state/control_priority", m["state_topic"])
+	assert.Equal(t, "oasis_syberia/cmd/control_priority", m["command_topic"])
+	assert.Equal(t, []any{"temperature", "humidity", "co2"}, m["options"])
+	assert.Equal(t, "select.oasis_syberia_control_priority", m["default_entity_id"])
+}
+
+func TestNumberPayload_JSONShape(t *testing.T) {
+	t.Parallel()
+	p := discovery.NumberPayload{
+		StateTopic:   "oasis_syberia/state/x",
+		CommandTopic: "oasis_syberia/cmd/x",
+	}
+	p.UniqueID = "oasis_syberia_x"
+
+	m := marshalToMap(t, p)
+	for _, k := range []string{"min", "max", "step"} {
+		assert.Containsf(t, m, k, "%s has no omitempty: a zero bound is meaningful", k)
+	}
+	for _, k := range []string{"mode", "unit_of_measurement", "device_class"} {
+		_, ok := m[k]
+		assert.Falsef(t, ok, "%q should be omitted when zero", k)
+	}
+
+	p.Min, p.Max, p.Step = 500, 2000, 10
+	p.Mode, p.UnitOfMeasurement, p.DeviceClass = "box", "ppm", "carbon_dioxide"
+	m = marshalToMap(t, p)
+	assert.InDelta(t, 500.0, m["min"], 1e-9)
+	assert.InDelta(t, 2000.0, m["max"], 1e-9)
+	assert.InDelta(t, 10.0, m["step"], 1e-9)
+	assert.Equal(t, "box", m["mode"])
+	assert.Equal(t, "ppm", m["unit_of_measurement"])
+	assert.Equal(t, "carbon_dioxide", m["device_class"])
 }

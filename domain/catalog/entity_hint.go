@@ -18,6 +18,10 @@ const (
 	EntityKindClimate
 	// EntityKindButton is a stateless button entity.
 	EntityKindButton
+	// EntityKindSelect is a writable select entity with a fixed option list.
+	EntityKindSelect
+	// EntityKindNumber is a writable numeric entity with min/max/step.
+	EntityKindNumber
 )
 
 // String returns the canonical lowercase label for the EntityKind.
@@ -35,6 +39,10 @@ func (k EntityKind) String() string {
 		return "climate"
 	case EntityKindButton:
 		return "button"
+	case EntityKindSelect:
+		return "select"
+	case EntityKindNumber:
+		return "number"
 	default:
 		return "unknown"
 	}
@@ -86,6 +94,8 @@ const (
 	DeviceClassPower DeviceClass = "power"
 	// DeviceClassDuration is the HA "duration" sensor device_class.
 	DeviceClassDuration DeviceClass = "duration"
+	// DeviceClassCarbonDioxide is the HA "carbon_dioxide" number/sensor device_class.
+	DeviceClassCarbonDioxide DeviceClass = "carbon_dioxide"
 )
 
 // StateClass is a typed string of the HA sensor state_class attribute.

@@ -89,14 +89,15 @@ func TestBuild_Count(t *testing.T) {
 	t.Parallel()
 	out := buildAll(t)
 	// Catalog has 13 entities with Hint.Kind != None (12 sensors + 1 switch),
-	// plus 1 climate + 3 binary_sensors + 1 derived current_operation sensor.
-	assert.Len(t, out, 18)
+	// plus 1 climate + 3 binary_sensors + 1 derived current_operation sensor,
+	// plus 14 panel settings (10 switches, 1 select, 3 numbers).
+	assert.Len(t, out, 32)
 }
 
 func TestBuild_TopicsAreCorrect(t *testing.T) {
 	t.Parallel()
 	out := buildAll(t)
-	re := regexp.MustCompile(`^homeassistant/(sensor|binary_sensor|switch|climate)/oasis_syberia/[a-z0-9_]+/config$`)
+	re := regexp.MustCompile(`^homeassistant/(sensor|binary_sensor|switch|select|number|climate)/oasis_syberia/[a-z0-9_]+/config$`)
 	for _, d := range out {
 		assert.Truef(t, re.MatchString(d.Topic), "topic %q does not match discovery shape", d.Topic)
 	}
@@ -147,7 +148,7 @@ func TestBuild_ContainsClimate(t *testing.T) {
 	assert.Equal(t, "oasis_syberia/cmd/fan_target", p.FanModeCommandTopic)
 	assert.Equal(t, "oasis_syberia/state/hvac_action", p.ActionTopic)
 	assert.Equal(t, "oasis_syberia_climate", p.UniqueID)
-	assert.Equal(t, "climate", p.ObjectID)
+	assert.Equal(t, "climate.oasis_syberia", p.DefaultEntityID)
 }
 
 func TestBuild_ContainsSwitch(t *testing.T) {
@@ -310,7 +311,7 @@ func TestBuild_FirmwareEmptyString_StillBuilds(t *testing.T) {
 func TestBuild_SensorCount(t *testing.T) {
 	t.Parallel()
 	out := buildAll(t)
-	var sensors, switches, climates, binSensors int
+	var sensors, switches, climates, binSensors, selects, numbers int
 	for _, d := range out {
 		switch {
 		case strings.Contains(d.Topic, "/sensor/"):
@@ -321,13 +322,20 @@ func TestBuild_SensorCount(t *testing.T) {
 			climates++
 		case strings.Contains(d.Topic, "/binary_sensor/"):
 			binSensors++
+		case strings.Contains(d.Topic, "/select/"):
+			selects++
+		case strings.Contains(d.Topic, "/number/"):
+			numbers++
 		}
 	}
-	// 12 sensors from catalog + derived current_operation, 1 switch, 1 climate, 3 binary_sensors.
+	// 12 sensors from catalog + derived current_operation, power + 10 setting
+	// switches, 1 climate, 3 binary_sensors, 1 select, 3 numbers.
 	assert.Equal(t, 13, sensors)
-	assert.Equal(t, 1, switches)
+	assert.Equal(t, 11, switches)
 	assert.Equal(t, 1, climates)
 	assert.Equal(t, 3, binSensors)
+	assert.Equal(t, 1, selects)
+	assert.Equal(t, 3, numbers)
 }
 
 func TestBuild_SensorFromCatalog_NoDeviceClass_OmitsField(t *testing.T) {
@@ -345,12 +353,8 @@ func TestBuild_SensorFromCatalog_NoDeviceClass_OmitsField(t *testing.T) {
 
 func TestCategoryString_Coverage(t *testing.T) {
 	t.Parallel()
-	// Indirect coverage: Default/Diagnostic exercised via buildAll above; the
-	// Config branch is not used by the catalog, so probe via a fresh builder
-	// constructed with a synthetic config-category binary_sensor through a
-	// dedicated public path... but no public path exists. Instead we assert
-	// the existing diagnostic+default cases produce the expected JSON values
-	// (already covered) — the unreachable Config branch is acceptable.
+	// Default, Diagnostic and Config are all reachable through Build: config
+	// via the panel settings (see TestBuild_AllSettingsAreConfigCategory).
 	out := buildAll(t)
 	require.NotEmpty(t, out)
 }
@@ -505,4 +509,119 @@ func TestBuild_FilterDaysSensors(t *testing.T) {
 			assert.False(t, hasCmd, "filter sensors are read-only")
 		})
 	}
+}
+
+func componentOf(t *testing.T, topic string) (component, objectID string) {
+	t.Helper()
+	parts := strings.Split(topic, "/")
+	require.Lenf(t, parts, 5, "topic %q", topic)
+	return parts[1], parts[3]
+}
+
+func TestBuild_DefaultEntityIDOnEveryPayload(t *testing.T) {
+	t.Parallel()
+	out := buildAll(t)
+	require.Len(t, out, 32)
+	for _, d := range out {
+		component, objectID := componentOf(t, d.Topic)
+		m := unmarshalMap(t, d.Payload)
+		want := component + ".oasis_syberia_" + objectID
+		if component == "climate" {
+			want = "climate.oasis_syberia"
+		}
+		assert.Equalf(t, want, m["default_entity_id"], "topic %q", d.Topic)
+		_, hasObjectID := m["object_id"]
+		assert.Falsef(t, hasObjectID, "topic %q must not carry object_id", d.Topic)
+	}
+}
+
+// settingPayload finds a setting's discovery payload and checks the fields
+// every config entity shares.
+func settingPayload(t *testing.T, out []discovery.Discovery, component, objectID string) map[string]any {
+	t.Helper()
+	topic := "homeassistant/" + component + "/oasis_syberia/" + objectID + "/config"
+	var found *discovery.Discovery
+	for i := range out {
+		if out[i].Topic == topic {
+			found = &out[i]
+		}
+	}
+	require.NotNilf(t, found, "discovery topic %s not built", topic)
+	m := unmarshalMap(t, found.Payload)
+	assert.Equal(t, "config", m["entity_category"])
+	assert.Equal(t, "oasis_syberia/state/"+objectID, m["state_topic"])
+	assert.Equal(t, "oasis_syberia/cmd/"+objectID, m["command_topic"])
+	assert.Equal(t, "oasis_syberia/availability", m["availability_topic"])
+	assert.Equal(t, "online", m["payload_available"])
+	assert.Equal(t, "offline", m["payload_not_available"])
+	assert.Equal(t, "oasis_syberia_"+objectID, m["unique_id"])
+	assert.Equal(t, component+".oasis_syberia_"+objectID, m["default_entity_id"])
+	return m
+}
+
+func TestBuild_SettingSwitch_AlarmBeep(t *testing.T) {
+	t.Parallel()
+	m := settingPayload(t, buildAll(t), "switch", "alarm_beep")
+	assert.Equal(t, "Alarm beep", m["name"])
+	assert.Equal(t, "ON", m["payload_on"])
+	assert.Equal(t, "OFF", m["payload_off"])
+	assert.Equal(t, "mdi:volume-high", m["icon"])
+}
+
+func TestBuild_ActiveFilterSwitch(t *testing.T) {
+	t.Parallel()
+	m := settingPayload(t, buildAll(t), "switch", "active_filter")
+	assert.Equal(t, "Active filter", m["name"])
+	assert.Equal(t, "mdi:air-purifier", m["icon"])
+}
+
+func TestBuild_ControlPrioritySelect(t *testing.T) {
+	t.Parallel()
+	m := settingPayload(t, buildAll(t), "select", "control_priority")
+	assert.Equal(t, "Control priority", m["name"])
+	assert.Equal(t, []any{"temperature", "humidity", "co2"}, m["options"])
+	assert.Equal(t, "mdi:format-list-numbered", m["icon"])
+}
+
+func TestBuild_SettingNumbers(t *testing.T) {
+	t.Parallel()
+	out := buildAll(t)
+	tests := []struct {
+		objectID    string
+		min, max    float64
+		step        float64
+		mode        string
+		unit        string
+		deviceClass any
+	}{
+		{objectID: "dark_brightness", min: 20, max: 100, step: 1, mode: "slider", unit: "%", deviceClass: nil},
+		{objectID: "humidity_target", min: 20, max: 95, step: 1, mode: "slider", unit: "%", deviceClass: "humidity"},
+		{objectID: "co2_target", min: 500, max: 2000, step: 10, mode: "box", unit: "ppm", deviceClass: "carbon_dioxide"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.objectID, func(t *testing.T) {
+			t.Parallel()
+			m := settingPayload(t, out, "number", tc.objectID)
+			assert.InDelta(t, tc.min, m["min"], 1e-9)
+			assert.InDelta(t, tc.max, m["max"], 1e-9)
+			assert.InDelta(t, tc.step, m["step"], 1e-9)
+			assert.Equal(t, tc.mode, m["mode"])
+			assert.Equal(t, tc.unit, m["unit_of_measurement"])
+			assert.Equal(t, tc.deviceClass, m["device_class"])
+		})
+	}
+}
+
+func TestBuild_AllSettingsAreConfigCategory(t *testing.T) {
+	t.Parallel()
+	n := 0
+	for _, d := range buildAll(t) {
+		component, _ := componentOf(t, d.Topic)
+		m := unmarshalMap(t, d.Payload)
+		if m["entity_category"] == "config" {
+			n++
+			assert.Containsf(t, []string{"switch", "select", "number"}, component, "topic %q", d.Topic)
+		}
+	}
+	assert.Equal(t, 14, n)
 }

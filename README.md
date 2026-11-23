@@ -28,8 +28,10 @@ Running in production on the author's homelab against a real GTC Oasis Syberia 5
 
 - Maintains exactly **one** Modbus TCP connection to the controller (the device refuses concurrent clients).
 - Polls registers on a tiered schedule (5 s / 15 s / 60 s) and decodes them into a typed `Snapshot`.
-- Publishes `homeassistant/.../config` MQTT discovery for 18 entities — climate, power switch, supply/room temperature, room humidity, supply/exhaust fan speed, filter clog %, filter days left / filter resource, heat demand, current operation, firmware, device id, plus heater-active / damper-open / problem binary sensors.
-- Subscribes to HA command topics (`cmd/power`, `cmd/hvac_mode`, `cmd/target_temperature`, `cmd/fan_target`) and translates them to Modbus writes — including the **edge sequence** required by `Power_Dev` and the **read-modify-write** required by `Dev_Keys_2`.
+- Publishes `homeassistant/.../config` MQTT discovery for 32 entities — climate, power switch, supply/room temperature, room humidity, supply/exhaust fan speed, filter clog %, filter days left / filter resource, heat demand, current operation, firmware, device id, heater-active / damper-open / problem binary sensors, plus 14 panel-menu settings as HA **config** entities (10 switches, 1 select, 3 numbers).
+- Every discovery payload carries `default_entity_id` (`<domain>.<device_prefix>_<object_id>`; the climate is `climate.<device_prefix>`), so HA does not prefix new entity ids with the device's area. HA honours it only when it first creates an entity; existing registry ids are kept.
+- Subscribes to HA command topics (`cmd/power`, `cmd/hvac_mode`, `cmd/target_temperature`, `cmd/fan_target`, and one `cmd/<object_id>` per panel setting) and translates them to Modbus writes — including the **edge sequence** required by `Power_Dev` and the **read-modify-write** required by `Dev_Keys_2`, `User_Keys_0` and `User_Dev_0`.
+- Reads every panel-setting write back and publishes the **actual** register value. The controller can acknowledge a write and silently ignore it; that case logs a warning, increments `oasis_modbus_write_not_applied_total{entity}` and HA keeps showing the real value.
 - Republishes discovery (and the current state, once polled) on every MQTT (re)connect and on every HA birth message, so entities come back after a broker restart without persistence.
 - Holds an automatic reconnect supervisor with exponential backoff + jitter for both Modbus and MQTT, surfaces `availability=online/offline` (LWT-backed) so HA correctly greys-out entities when the bridge is down.
 - Refuses writes while the controller is in a transition phase (`close_damper`, `electric_calorifier_purge`, …) and exposes the current operation as a sensor so users can see *why*.
@@ -84,7 +86,7 @@ Multi-arch images (`linux/amd64`, `linux/arm64`) are published to `ghcr.io/alexm
 ### Build from source
 
 ```bash
-make build           # ./bin/oasis-modbus2mqtt
+make build           # ./bin/oasis-modbus2mqtt (version from git describe)
 make docker-build    # oasis-modbus2mqtt:latest
 make test            # unit + race
 make test-coverage   # coverage report
@@ -92,7 +94,7 @@ make lint            # golangci-lint v2
 make tidy            # go mod tidy
 ```
 
-Requires Go 1.25+.
+Requires Go 1.25+. The startup log line reports the build version: the tag on tag images, `sha-<7>` on `main` images, `dev` for a plain `go build`. Pass `--build-arg VERSION=...` to `docker build` to set it.
 
 ## Configuration
 
@@ -114,7 +116,7 @@ All configuration is via environment variables. Defaults in parens.
 | `MQTT_KEEPALIVE` | `30s` | Paho keepalive |
 | `MQTT_QOS` | `1` | QoS for state and command topics |
 | `HA_DISCOVERY_PREFIX` | `homeassistant` | HA MQTT discovery prefix |
-| `HA_DEVICE_PREFIX` | `oasis_syberia` | `object_id` namespace |
+| `HA_DEVICE_PREFIX` | `oasis_syberia` | namespace for unique ids, topics and `default_entity_id` |
 | `HA_DEVICE_NAME` | `Oasis Syberia` | Display name |
 | `HA_MANUFACTURER` | `GTC` | |
 | `HA_MODEL` | `Syberia 5` | |
@@ -160,18 +162,46 @@ The Oasis Syberia controller permits **only one** TCP client — you cannot run 
 | `sensor.oasis_syberia_current_operation` | sensor (text) | `idle` / `close_damper` / `preheat_calorifier` / … |
 | `sensor.oasis_syberia_firmware` | sensor (diagnostic) | e.g. `v5.2.0` |
 | `sensor.oasis_syberia_device_id` | sensor (diagnostic) | hex device id |
-| `binary_sensor.oasis_syberia_heater_active` | binary_sensor (heat) | electric heater pulsing |
+| `binary_sensor.oasis_syberia_heater_active` | binary_sensor (heat) | PID heat demand > 0 while powered (`Reg` i18). Stable while heating: it no longer follows the ~1 Hz heater PWM output. `hvac_action=heating` uses the same signal |
 | `binary_sensor.oasis_syberia_damper_open` | binary_sensor (opening) | inlet damper |
 | `binary_sensor.oasis_syberia_problem` | binary_sensor (problem, diag.) | any `Error_Code_*` bit set |
+
+Entity ids above are what `default_entity_id` asks for on a fresh install. An HA that already registered an entity keeps its id (for example a climate created before `default_entity_id` existed may be `climate.oasis_syberia_mqtt_hvac`).
+
+### Panel settings (config entities)
+
+The panel's settings menu, read every 60 s (slow tier) as two spans, h22..h25 and h35..h36, and shown under the device's **Configuration** section. Bitfield writes are read-modify-write on a fresh controller read, so bits the bridge does not expose are preserved. Every write is read back; HA shows the actual value. Settings stay `unknown` until the first successful read, and writes are refused while the controller is in a transition phase.
+
+| Entity | Type | Register / bits | Notes |
+|---|---|---|---|
+| `switch.oasis_syberia_nord_start` | switch | h22 bit 1 | North start (cold-climate start-up) |
+| `switch.oasis_syberia_touch_click` | switch | h22 bit 5 | Touch click sound |
+| `switch.oasis_syberia_alarm_beep` | switch | h22 bit 6 | Alarm beep |
+| `switch.oasis_syberia_stop_on_filter_full` | switch | h22 bit 7 | Stop when the filter reaches 100 % |
+| `switch.oasis_syberia_auto_restart` | switch | h22 bit 8 | Auto restart after power loss |
+| `switch.oasis_syberia_performance_control` | switch | h22 bit 9 | Auto fan-speed reduction when the setpoint is not reached |
+| `switch.oasis_syberia_dark_screen` | switch | h22 bit 10 | Dark screen |
+| `switch.oasis_syberia_humidifier` | switch | h22 bit 12 | Humidifier |
+| `switch.oasis_syberia_stop_on_conditioner_alarm` | switch | h22 bit 15 | Stop on conditioner alarm |
+| `select.oasis_syberia_control_priority` | select | h22 bits 13..14 | `temperature` / `humidity` / `co2` (vendor PDF; the panel calls the third option "pressure", unverified). Raw value 3 shows `unknown` and is never written |
+| `switch.oasis_syberia_active_filter` | switch | h25 bit 2 | Active filter |
+| `number.oasis_syberia_dark_brightness` | number (%, slider) | h23 | 20..100, step 1. Bridge assumption: the register map gives no range; 20 % is the value observed on the live panel |
+| `number.oasis_syberia_humidity_target` | number (%, humidity, slider) | h35 | 20..95, step 1 |
+| `number.oasis_syberia_co2_target` | number (ppm, carbon_dioxide, box) | h36 | 500..2000 (vendor PDF), step 10. The step is a bridge assumption; the register map gives only the range |
+
+h22 bit 2 (remote server access) and bits 0, 3, 4 and 11 (reserved or demo) are deliberately not exposed. h24 (`IR_Remoute_Time`) is read only to keep the h22..h25 span contiguous. Invalid commands (out of range, off the step grid, non-integral, unknown option) are rejected before any Modbus write and logged as `invalid command payload`. A command that asks for the value the register already holds skips the Modbus write (these registers are EEPROM-backed) but is still read back and published.
+
+Commands are applied by one worker in arrival order, off the MQTT client's network goroutine. Up to 32 commands may wait; a burst beyond that is dropped and logged as `command queue full, command dropped`.
 
 ## Observability
 
 - **Logs** — structured JSON via `log/slog` to stdout. Levels: `INFO` for lifecycle (connect, discovery, online/offline, command applied), `WARN` for transient errors and command rejections, `ERROR` for fatal.
 - **Metrics** — Prometheus scrape on `:8080/metrics`. Notable series:
-  - `oasis_modbus_ops_total{op,status}`, `oasis_modbus_op_duration_seconds{op}`, `oasis_modbus_errors_total{type}`
+  - `oasis_modbus_ops_total{op,status}` (`status=skipped` on `op=modify_holding_write` counts no-op writes not sent), `oasis_modbus_op_duration_seconds{op}`, `oasis_modbus_errors_total{type}`
   - `oasis_modbus_reconnects_total`, `oasis_modbus_connected` (gauge 0/1)
   - `oasis_mqtt_publishes_total`, `oasis_mqtt_reconnects_total`, `oasis_mqtt_connected`
   - `oasis_poll_duration_seconds{tier}`, `oasis_last_successful_poll_unix_nanos`
+  - `oasis_modbus_write_not_applied_total{entity}` — settings writes the controller acknowledged but did not apply (read-back mismatch); should stay absent or 0
 - **Health probes** — `/health/live` always 200; `/health/ready` 503 when MQTT is disconnected or the latest snapshot is older than 120 s.
 
 ## Hardware compatibility

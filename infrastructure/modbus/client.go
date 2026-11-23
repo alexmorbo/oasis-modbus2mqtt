@@ -160,7 +160,8 @@ func (c *Client) WriteHolding(ctx context.Context, addr, value uint16) error {
 
 // ModifyHolding atomically reads, modifies, and writes the holding register
 // at addr. The mutex is held across the whole sequence so no other op on
-// this Client interleaves between read and write.
+// this Client interleaves between read and write. When modify returns the
+// value already stored, the write is skipped.
 func (c *Client) ModifyHolding(ctx context.Context, addr uint16, modify func(current uint16) uint16) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -211,6 +212,16 @@ func (c *Client) ModifyHolding(ctx context.Context, addr uint16, modify func(cur
 		)
 		metrics.ModbusErrorsTotal("modify_panic").Inc()
 		return modifyErr
+	}
+
+	if newVal == current {
+		// No-op: skip the write so EEPROM-backed registers are not worn.
+		metrics.ModbusOpsTotal("modify_holding_write", "skipped").Inc()
+		c.logger.Debug("modbus modify skipped: value unchanged",
+			slog.Int("addr", int(addr)),
+			slog.Int("value", int(current)),
+		)
+		return nil
 	}
 
 	if err := c.waitGuardInterval(ctx); err != nil {

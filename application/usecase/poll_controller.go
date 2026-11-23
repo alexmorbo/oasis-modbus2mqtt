@@ -12,6 +12,7 @@ import (
 	"math"
 
 	"github.com/alexmorbo/oasis-modbus2mqtt/application/port"
+	"github.com/alexmorbo/oasis-modbus2mqtt/domain/catalog"
 	"github.com/alexmorbo/oasis-modbus2mqtt/domain/entity"
 	"github.com/alexmorbo/oasis-modbus2mqtt/domain/valueobject"
 )
@@ -151,10 +152,11 @@ func (p *PollController) PollMedium(ctx context.Context) (entity.Snapshot, error
 	return snap, nil
 }
 
-// PollSlow reads the slow-tier register set (i0, i79, h0, h344, h346) and
-// returns a Snapshot populated with the slow-tier fields. i0, i79 and h0 are
-// mandatory; the filter registers are best-effort and only populated (with
-// FilterPolledAt set) when both read successfully.
+// PollSlow reads the slow-tier register set (i0, i79, h0, h22..h25, h35..h36,
+// h344, h346) and returns a Snapshot populated with the slow-tier fields. i0,
+// i79 and h0 are mandatory. The panel settings and the filter registers are
+// best-effort and only populated (with SettingsPolledAt / FilterPolledAt set)
+// when all their reads succeed.
 func (p *PollController) PollSlow(ctx context.Context) (entity.Snapshot, error) {
 	in1, err := p.dispatcher.ReadInput(ctx, 0, 1)
 	if err != nil {
@@ -187,6 +189,12 @@ func (p *PollController) PollSlow(ctx context.Context) (entity.Snapshot, error) 
 		PolledAt:     p.clock.Now(),
 	}
 
+	// Settings go before the filter pair, whose branch returns early on failure.
+	if settings, ok := p.readSettings(ctx); ok {
+		snap.Settings = settings
+		snap.SettingsPolledAt = p.clock.Now()
+	}
+
 	// h344 and h346 are read separately (h345 is undocumented) and
 	// best-effort: controller variants without them must not lose the
 	// firmware/device_id reads above.
@@ -203,6 +211,40 @@ func (p *PollController) PollSlow(ctx context.Context) (entity.Snapshot, error) 
 	snap.FilterDaysLeft = int16(daysLeft) //nolint:gosec // same-size reinterpret; overdue filter reads negative days
 	snap.FilterPolledAt = p.clock.Now()
 	return snap, nil
+}
+
+// readSettings reads the panel-menu settings as two spans over documented
+// registers only (h26..h34 are skipped). A failed or short read is logged at
+// Warn and reported as ok=false; the second span is not read if the first fails.
+func (p *PollController) readSettings(ctx context.Context) (entity.PanelSettings, bool) {
+	keys, ok := p.readSettingsSpan(ctx, catalog.AddrUserKeys0.Uint16(), 4, "h22..h25")
+	if !ok {
+		return entity.PanelSettings{}, false
+	}
+	targets, ok := p.readSettingsSpan(ctx, catalog.AddrHumidityTarget.Uint16(), 2, "h35..h36")
+	if !ok {
+		return entity.PanelSettings{}, false
+	}
+	return entity.PanelSettings{
+		UserKeys0:      keys[0],
+		DarkBrightness: keys[1],
+		IRRemoteTime:   keys[2],
+		UserDev0:       keys[3],
+		HumidityTarget: targets[0],
+		CO2Target:      targets[1],
+	}, true
+}
+
+func (p *PollController) readSettingsSpan(ctx context.Context, start, count uint16, label string) ([]uint16, bool) {
+	regs, err := p.dispatcher.ReadHolding(ctx, start, count)
+	if err == nil && len(regs) != int(count) {
+		err = fmt.Errorf("got %d regs: %w", len(regs), ErrUnexpectedReadLength)
+	}
+	if err != nil {
+		p.logger.Warn("poll_slow settings read failed", "register", label, "error", err)
+		return nil, false
+	}
+	return regs, true
 }
 
 // readFilterRegister reads one best-effort filter holding register. A failed

@@ -29,3 +29,7 @@ var ErrCommandTimeout = errors.New("command timeout")
 // ErrInvalidPayload is returned by CommandSubscriber when an MQTT payload
 // cannot be decoded into a known Command.
 var ErrInvalidPayload = errors.New("invalid command payload")
+
+// ErrWriteNotApplied is returned when the controller acknowledged a write but
+// the read-back shows the requested value was not applied.
+var ErrWriteNotApplied = errors.New("controller acknowledged write but did not apply it")

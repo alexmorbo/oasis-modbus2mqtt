@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -107,6 +108,7 @@ func TestHandle_OnlinePayload_InvokesCallback(t *testing.T) {
 			h, ok := sub.handler("homeassistant/status")
 			require.True(t, ok)
 			h("homeassistant/status", []byte(tc.payload))
+			<-l.Idle()
 			assert.Equal(t, int32(1), calls.Load())
 		})
 	}
@@ -123,6 +125,7 @@ func TestHandle_OfflinePayload_DoesNotInvokeCallback(t *testing.T) {
 	h, ok := sub.handler("homeassistant/status")
 	require.True(t, ok)
 	h("homeassistant/status", []byte("offline"))
+	<-l.Idle()
 	assert.Equal(t, int32(0), calls.Load())
 }
 
@@ -141,6 +144,7 @@ func TestHandle_GarbagePayload_DoesNotInvokeCallback(t *testing.T) {
 			h, ok := sub.handler("homeassistant/status")
 			require.True(t, ok)
 			h("homeassistant/status", []byte(payload))
+			<-l.Idle()
 			assert.Equal(t, int32(0), calls.Load())
 		})
 	}
@@ -173,5 +177,76 @@ func TestHandle_CallbackReceivesBoundedContext(t *testing.T) {
 	h, ok := sub.handler("homeassistant/status")
 	require.True(t, ok)
 	h("homeassistant/status", []byte("online"))
+	<-l.Idle()
 	assert.True(t, deadlineSet.Load(), "callback context must carry a deadline")
+}
+
+func TestHandle_DoesNotBlockOnCallback_AndCoalescesBirths(t *testing.T) {
+	t.Parallel()
+	sub := &fakeHASubscriber{}
+	entered := make(chan struct{}, 16)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	l := service.NewHAStatusListener(sub, "homeassistant/status",
+		func(_ context.Context) {
+			calls.Add(1)
+			entered <- struct{}{}
+			<-release
+		},
+		discardLoggerHA())
+	require.NoError(t, l.Start(t.Context()))
+	h, ok := sub.handler("homeassistant/status")
+	require.True(t, ok)
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		h("homeassistant/status", []byte("online"))
+	}()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("handle blocked on the callback: it runs on the MQTT router goroutine")
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback never ran")
+	}
+
+	// Three births during the run coalesce into exactly one more run.
+	for range 3 {
+		h("homeassistant/status", []byte("online"))
+	}
+	select {
+	case <-l.Idle():
+		t.Fatal("listener reported idle while a run is in flight")
+	default:
+	}
+	close(release)
+	<-l.Idle()
+	assert.Equal(t, int32(2), calls.Load(), "one run plus one coalesced re-run")
+
+	h("homeassistant/status", []byte("online"))
+	<-l.Idle()
+	assert.Equal(t, int32(3), calls.Load(), "a birth after the runs finished starts a new run")
+}
+
+func TestHandle_CallbackCtxCancelledByStartCtx(t *testing.T) {
+	t.Parallel()
+	sub := &fakeHASubscriber{}
+	ctx, cancel := context.WithCancel(t.Context())
+	l := service.NewHAStatusListener(sub, "homeassistant/status",
+		func(cbCtx context.Context) { <-cbCtx.Done() },
+		discardLoggerHA())
+	require.NoError(t, l.Start(ctx))
+	h, ok := sub.handler("homeassistant/status")
+	require.True(t, ok)
+	h("homeassistant/status", []byte("online"))
+	cancel()
+	select {
+	case <-l.Idle():
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback ctx must derive from the Start ctx")
+	}
 }

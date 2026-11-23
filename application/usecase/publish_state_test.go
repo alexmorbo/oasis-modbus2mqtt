@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -100,7 +101,7 @@ func sampleSnapshot(t *testing.T) entity.Snapshot {
 		FanState2:         3,
 		HeaterPWM:         true,
 		DamperOpen:        true,
-		PIDDemand:         42,
+		PIDDemand:         42, // heat demand > 0 → heater_active ON, hvac_action heating
 		FilterPct:         15,
 		FilterResource:    150,
 		FilterDaysLeft:    120,
@@ -342,6 +343,7 @@ func TestHvacAction_PreheatTransition(t *testing.T) {
 	snap := sampleSnapshot(t)
 	snap.Operation = entity.OpPreheatCalorifier
 	snap.HeaterPWM = false
+	snap.PIDDemand = 0
 	snap.FanState1 = 0
 
 	require.NoError(t, ps.Apply(context.Background(), snap))
@@ -357,6 +359,7 @@ func TestHvacAction_StartFanTransition(t *testing.T) {
 	snap := sampleSnapshot(t)
 	snap.Operation = entity.OpStartFan
 	snap.HeaterPWM = false
+	snap.PIDDemand = 0
 
 	require.NoError(t, ps.Apply(context.Background(), snap))
 	c, ok := pub.findCall("test/state/hvac_action")
@@ -371,20 +374,22 @@ func TestHvacAction_FanCoastdown(t *testing.T) {
 	snap := sampleSnapshot(t)
 	snap.Operation = entity.OpFanCoastdown
 	snap.HeaterPWM = true
+	snap.PIDDemand = 42
 
 	require.NoError(t, ps.Apply(context.Background(), snap))
 	c, ok := pub.findCall("test/state/hvac_action")
 	require.True(t, ok)
-	assert.Equal(t, []byte("fan"), c.payload, "fan transitions outrank heater PWM")
+	assert.Equal(t, []byte("fan"), c.payload, "fan transitions outrank heat demand")
 }
 
-func TestHvacAction_HeaterPWM(t *testing.T) {
+func TestHvacAction_HeatDemand(t *testing.T) {
 	t.Parallel()
 	pub := &fakeStatePublisher{}
 	ps := usecase.NewPublishState(pub, fakeTopics{}, discardLoggerState())
 	snap := sampleSnapshot(t)
 	snap.Operation = entity.OpIdle
-	snap.HeaterPWM = true
+	snap.HeaterPWM = false
+	snap.PIDDemand = 30
 	snap.FanState1 = 5
 
 	require.NoError(t, ps.Apply(context.Background(), snap))
@@ -400,6 +405,7 @@ func TestHvacAction_FanRunning(t *testing.T) {
 	snap := sampleSnapshot(t)
 	snap.Operation = entity.OpIdle
 	snap.HeaterPWM = false
+	snap.PIDDemand = 0
 	snap.FanState1 = 4
 
 	require.NoError(t, ps.Apply(context.Background(), snap))
@@ -415,6 +421,7 @@ func TestHvacAction_Idle(t *testing.T) {
 	snap := sampleSnapshot(t)
 	snap.Operation = entity.OpIdle
 	snap.HeaterPWM = false
+	snap.PIDDemand = 0
 	snap.FanState1 = 0
 
 	require.NoError(t, ps.Apply(context.Background(), snap))
@@ -556,4 +563,252 @@ func TestApply_LogsPublishedCount(t *testing.T) {
 	out := buf.String()
 	assert.Contains(t, out, "state published")
 	assert.Contains(t, out, `"count":21`)
+}
+
+func withSettings(snap entity.Snapshot) entity.Snapshot {
+	snap.Settings = entity.PanelSettings{
+		UserKeys0: 0x07E4, DarkBrightness: 20, IRRemoteTime: 3, UserDev0: 0x0004,
+		HumidityTarget: 50, CO2Target: 500,
+	}
+	snap.SettingsPolledAt = time.Date(2026, 11, 23, 10, 0, 0, 0, time.UTC)
+	return snap
+}
+
+func payloadOf(t *testing.T, pub *fakeStatePublisher, objectID string) string {
+	t.Helper()
+	c, ok := pub.findCall("test/state/" + objectID)
+	require.Truef(t, ok, "no state published for %s", objectID)
+	return string(c.payload)
+}
+
+func TestApply_SettingsTopicsGatedOnSettingsPolledAt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		mutate    func(s entity.Snapshot) entity.Snapshot
+		wantCount int
+		wantSet   bool
+	}{
+		{
+			name: "nothing best-effort polled",
+			mutate: func(s entity.Snapshot) entity.Snapshot {
+				s.FilterPolledAt = time.Time{}
+				return s
+			},
+			wantCount: 19,
+		},
+		{name: "filter only", mutate: func(s entity.Snapshot) entity.Snapshot { return s }, wantCount: 21},
+		{
+			name: "settings only",
+			mutate: func(s entity.Snapshot) entity.Snapshot {
+				s.FilterPolledAt = time.Time{}
+				return withSettings(s)
+			},
+			wantCount: 33,
+			wantSet:   true,
+		},
+		{name: "both", mutate: withSettings, wantCount: 35, wantSet: true},
+		{
+			name: "settings values without SettingsPolledAt stay unpublished",
+			mutate: func(s entity.Snapshot) entity.Snapshot {
+				s = withSettings(s)
+				s.SettingsPolledAt = time.Time{}
+				return s
+			},
+			wantCount: 21,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pub := &fakeStatePublisher{}
+			ps := usecase.NewPublishState(pub, fakeTopics{}, discardLoggerState())
+			require.NoError(t, ps.Apply(context.Background(), tc.mutate(sampleSnapshot(t))))
+			calls := pub.snapshot()
+			assert.Len(t, calls, tc.wantCount)
+			for _, c := range calls {
+				assert.True(t, c.retained)
+			}
+			_, has := pub.findCall("test/state/alarm_beep")
+			assert.Equal(t, tc.wantSet, has)
+		})
+	}
+}
+
+func TestApply_SettingsPayloads(t *testing.T) {
+	t.Parallel()
+	pub := &fakeStatePublisher{}
+	ps := usecase.NewPublishState(pub, fakeTopics{}, discardLoggerState())
+	require.NoError(t, ps.Apply(context.Background(), withSettings(sampleSnapshot(t))))
+
+	want := map[string]string{
+		"nord_start":                "OFF",
+		"touch_click":               "ON",
+		"alarm_beep":                "ON",
+		"stop_on_filter_full":       "ON",
+		"auto_restart":              "ON",
+		"performance_control":       "ON",
+		"dark_screen":               "ON",
+		"humidifier":                "OFF",
+		"stop_on_conditioner_alarm": "OFF",
+		"control_priority":          "temperature",
+		"active_filter":             "ON",
+		"dark_brightness":           "20",
+		"humidity_target":           "50",
+		"co2_target":                "500",
+	}
+	for id, payload := range want {
+		assert.Equalf(t, payload, payloadOf(t, pub, id), "%s", id)
+	}
+
+	var order []string
+	for _, c := range pub.snapshot() {
+		order = append(order, c.topic)
+	}
+	assert.Less(t, indexOf(order, "test/state/filter_resource"), indexOf(order, "test/state/nord_start"),
+		"settings follow the filter pair")
+	assert.Less(t, indexOf(order, "test/state/nord_start"), indexOf(order, "test/state/co2_target"),
+		"settings keep catalog table order")
+}
+
+func indexOf(xs []string, x string) int {
+	for i, v := range xs {
+		if v == x {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestApply_SelectUnknownPublishesNoneAndWarnsOnce(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	pub := &fakeStatePublisher{}
+	ps := usecase.NewPublishState(pub, fakeTopics{}, logger)
+
+	snap := withSettings(sampleSnapshot(t))
+	raw3 := snap
+	raw3.Settings.UserKeys0 = 0x67E4 // bits 13..14 = 3
+
+	warnings := func() int { return strings.Count(buf.String(), "setting value has no label") }
+
+	for range 2 {
+		pub.reset()
+		require.NoError(t, ps.Apply(context.Background(), raw3))
+		assert.Equal(t, "None", payloadOf(t, pub, "control_priority"))
+		assert.Equal(t, "ON", payloadOf(t, pub, "alarm_beep"), "other h22 settings still decode")
+	}
+	assert.Equal(t, 1, warnings(), "the same unknown value warns once")
+	assert.Contains(t, buf.String(), "object_id=control_priority raw=3")
+
+	require.NoError(t, ps.Apply(context.Background(), snap))
+	assert.Equal(t, 1, warnings(), "a known value does not warn")
+
+	require.NoError(t, ps.Apply(context.Background(), raw3))
+	assert.Equal(t, 2, warnings(), "becoming unknown again warns again")
+}
+
+func TestApply_NumberOutOfRangePublishesNone(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	pub := &fakeStatePublisher{}
+	ps := usecase.NewPublishState(pub, fakeTopics{}, logger)
+
+	snap := withSettings(sampleSnapshot(t))
+	snap.Settings.HumidityTarget = 96
+	snap.Settings.CO2Target = 0
+	require.NoError(t, ps.Apply(context.Background(), snap))
+	assert.Equal(t, "None", payloadOf(t, pub, "humidity_target"))
+	assert.Equal(t, "None", payloadOf(t, pub, "co2_target"))
+	assert.Equal(t, "20", payloadOf(t, pub, "dark_brightness"))
+	assert.Equal(t, 2, strings.Count(buf.String(), "setting value has no label"))
+
+	snap.Settings.HumidityTarget = 97
+	require.NoError(t, ps.Apply(context.Background(), snap))
+	assert.Equal(t, 3, strings.Count(buf.String(), "setting value has no label"),
+		"a different unknown raw value warns again; co2 stays silent")
+}
+
+func heaterStates(t *testing.T, pub *fakeStatePublisher) (heater, action string) {
+	t.Helper()
+	return payloadOf(t, pub, "heater_active"), payloadOf(t, pub, "hvac_action")
+}
+
+func TestHeaterActive_StableAcrossPWMToggle(t *testing.T) {
+	t.Parallel()
+	pub := &fakeStatePublisher{}
+	ps := usecase.NewPublishState(pub, fakeTopics{}, discardLoggerState())
+	snap := sampleSnapshot(t)
+	snap.Operation = entity.OpIdle
+	snap.PIDDemand = 42
+
+	for i, pwm := range []bool{true, false, true} {
+		pub.reset()
+		snap.HeaterPWM = pwm
+		require.NoError(t, ps.Apply(context.Background(), snap))
+		heater, action := heaterStates(t, pub)
+		assert.Equalf(t, "ON", heater, "poll %d (PWM=%t)", i, pwm)
+		assert.Equalf(t, "heating", action, "poll %d (PWM=%t)", i, pwm)
+	}
+}
+
+func TestHeaterActive_RegZeroIsOff(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		fanState1  uint16
+		wantAction string
+	}{
+		{name: "fan running", fanState1: 4, wantAction: "fan"},
+		{name: "fan stopped", fanState1: 0, wantAction: "idle"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pub := &fakeStatePublisher{}
+			ps := usecase.NewPublishState(pub, fakeTopics{}, discardLoggerState())
+			snap := sampleSnapshot(t)
+			snap.Operation = entity.OpIdle
+			snap.PIDDemand = 0
+			snap.HeaterPWM = true
+			snap.FanState1 = tc.fanState1
+			require.NoError(t, ps.Apply(context.Background(), snap))
+			heater, action := heaterStates(t, pub)
+			assert.Equal(t, "OFF", heater)
+			assert.Equal(t, tc.wantAction, action)
+		})
+	}
+}
+
+func TestHeaterActive_PowerOff(t *testing.T) {
+	t.Parallel()
+	pub := &fakeStatePublisher{}
+	ps := usecase.NewPublishState(pub, fakeTopics{}, discardLoggerState())
+	snap := sampleSnapshot(t)
+	snap.PowerOn = false
+	snap.PIDDemand = 42
+	snap.HeaterPWM = true
+	require.NoError(t, ps.Apply(context.Background(), snap))
+	heater, action := heaterStates(t, pub)
+	assert.Equal(t, "OFF", heater)
+	assert.Equal(t, "off", action)
+}
+
+func TestApply_ConcurrentSettingsWarnState(t *testing.T) {
+	t.Parallel()
+	ps := usecase.NewPublishState(&fakeStatePublisher{}, fakeTopics{}, discardLoggerState())
+	snap := withSettings(sampleSnapshot(t))
+	snap.Settings.UserKeys0 = 0x67E4
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = ps.Apply(context.Background(), snap)
+		}()
+	}
+	wg.Wait()
 }

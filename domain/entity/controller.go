@@ -22,6 +22,14 @@ import (
 // best-effort reads: FilterPolledAt is zero until they have been read
 // successfully at least once, and consumers must not publish them before.
 //
+// Settings holds the raw panel-menu holding registers (h22..h25, h35..h36).
+// They are a best-effort slow-tier read: SettingsPolledAt is zero until the
+// first successful read, and consumers must not publish them before.
+//
+// HeaterPWM is DOutputs bits 0..1. It pulses ~1 Hz while heating (quirk §7),
+// so it stays in the snapshot for diagnostics only; HeaterActive is the
+// user-facing heat signal.
+//
 // Errors is retained for backwards compatibility but is NOT populated by the
 // merger — RawErrors holds the raw register reads and DecodeErrorSet derives
 // a fresh ErrorSet on demand. Callers that need current error flags should
@@ -50,6 +58,8 @@ type Snapshot struct {
 	FilterResource    uint16
 	FilterDaysLeft    int16
 	FilterPolledAt    time.Time
+	Settings          PanelSettings
+	SettingsPolledAt  time.Time
 	Errors            ErrorSet
 	RawErrors         [4]uint16
 	RoomHumidity      uint16
@@ -61,6 +71,10 @@ type Snapshot struct {
 func (s Snapshot) IsHealthy(now time.Time, threshold time.Duration) bool {
 	return now.Sub(s.PolledAt) <= threshold
 }
+
+// HeaterActive reports PID heat demand while powered. HeaterPWM pulses ~1 Hz (quirk §7)
+// and stays in the snapshot for diagnostics only; nothing user-facing may toggle on it.
+func (s Snapshot) HeaterActive() bool { return s.PowerOn && s.PIDDemand > 0 }
 
 // DecodeErrorSet returns a freshly decoded ErrorSet from RawErrors. Prefer this
 // over the static Errors field, which is left untouched by the poller.

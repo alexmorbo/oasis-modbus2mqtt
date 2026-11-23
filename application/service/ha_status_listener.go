@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alexmorbo/oasis-modbus2mqtt/application/port"
@@ -31,11 +32,22 @@ type HAOnlineCallback func(ctx context.Context)
 // (typically "homeassistant/status") and invokes a callback when HA
 // announces it is online again. It is policy-free: the decision of what
 // to do on online lives in the composition root.
+//
+// The MQTT client runs handlers on its router goroutine, which also
+// processes PUBACKs, so the callback (a QoS 1 republish) runs on its own
+// goroutine. At most one run is in flight; births arriving during a run
+// coalesce into exactly one more run after it.
 type HAStatusListener struct {
 	sub      HAStatusSubscriber
 	topic    string
 	onOnline HAOnlineCallback
 	logger   *slog.Logger
+
+	mu      sync.Mutex
+	baseCtx context.Context //nolint:containedctx // lifetime ctx from Start, roots each callback run
+	running bool
+	pending bool
+	idle    chan struct{} // closed when the current run ends
 }
 
 // NewHAStatusListener constructs a listener. A nil subscriber, an empty
@@ -69,6 +81,9 @@ func NewHAStatusListener(
 // Start registers the message handler on the configured topic. It returns
 // the subscribe error wrapped with the topic string on failure.
 func (l *HAStatusListener) Start(ctx context.Context) error {
+	l.mu.Lock()
+	l.baseCtx = ctx
+	l.mu.Unlock()
 	if err := l.sub.Subscribe(ctx, l.topic, l.handle); err != nil {
 		return err
 	}
@@ -78,9 +93,9 @@ func (l *HAStatusListener) Start(ctx context.Context) error {
 
 // handle is the port.MessageHandler invoked by the MQTT client per
 // delivered message. It parses the payload (case-insensitive,
-// whitespace-trimmed) and dispatches to the online callback or logs
-// the offline event. Garbage payloads log WARN and are otherwise
-// ignored.
+// whitespace-trimmed) and schedules the online callback or logs the
+// offline event. It never blocks on the callback. Garbage payloads log
+// WARN and are otherwise ignored.
 func (l *HAStatusListener) handle(topic string, payload []byte) {
 	raw := strings.TrimSpace(strings.ToLower(string(payload)))
 	switch raw {
@@ -89,12 +104,60 @@ func (l *HAStatusListener) handle(topic string, payload []byte) {
 		if l.onOnline == nil {
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), haStatusHandlerTimeout)
-		defer cancel()
-		l.onOnline(ctx)
+		l.schedule()
 	case "offline":
 		l.logger.Info("ha offline detected", "topic", topic)
 	default:
 		l.logger.Warn("ha status: unexpected payload", "topic", topic, "payload", string(payload))
 	}
+}
+
+// schedule starts a callback run unless one is in flight, in which case it
+// marks one more run as pending.
+func (l *HAStatusListener) schedule() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.running {
+		l.pending = true
+		return
+	}
+	l.running = true
+	l.idle = make(chan struct{})
+	base := l.baseCtx
+	if base == nil {
+		base = context.Background()
+	}
+	go l.run(base, l.idle)
+}
+
+// run invokes the callback, then once more for each coalesced pending birth.
+func (l *HAStatusListener) run(base context.Context, idle chan struct{}) {
+	for {
+		ctx, cancel := context.WithTimeout(base, haStatusHandlerTimeout)
+		l.onOnline(ctx)
+		cancel()
+
+		l.mu.Lock()
+		if !l.pending {
+			l.running = false
+			close(idle)
+			l.mu.Unlock()
+			return
+		}
+		l.pending = false
+		l.mu.Unlock()
+	}
+}
+
+// Idle returns a channel that is closed once no callback run is in flight.
+// A birth arriving after that starts a new run.
+func (l *HAStatusListener) Idle() <-chan struct{} {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.running {
+		done := make(chan struct{})
+		close(done)
+		return done
+	}
+	return l.idle
 }

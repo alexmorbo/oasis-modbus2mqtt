@@ -12,6 +12,7 @@ import (
 	"github.com/alexmorbo/oasis-modbus2mqtt/domain/entity"
 	"github.com/alexmorbo/oasis-modbus2mqtt/infrastructure/config"
 	"github.com/alexmorbo/oasis-modbus2mqtt/infrastructure/discovery"
+	"github.com/alexmorbo/oasis-modbus2mqtt/infrastructure/metrics"
 	infrabus "github.com/alexmorbo/oasis-modbus2mqtt/infrastructure/modbus"
 	infmqtt "github.com/alexmorbo/oasis-modbus2mqtt/infrastructure/mqtt"
 	inthttp "github.com/alexmorbo/oasis-modbus2mqtt/interface/http"
@@ -41,13 +42,18 @@ const pollerShutdownTimeout = 5 * time.Second
 // manager goroutine to exit after ctx cancellation.
 const availMgrShutdownTimeout = 2 * time.Second
 
+// mqttWorkersShutdownTimeout bounds how long Run waits for the command
+// worker and an in-flight HA-birth republish to exit after ctx cancellation.
+// Both run on runCtx-derived contexts, so they return promptly.
+const mqttWorkersShutdownTimeout = 2 * time.Second
+
 // mqttDisconnectQuiesce is the quiesce window passed to the MQTT client
 // during graceful shutdown so in-flight publishes can drain.
 const mqttDisconnectQuiesce = 500 * time.Millisecond
 
 // republishTimeout bounds one discovery+state republish, triggered
-// by an MQTT (re)connect or an HA "online" birth message. The fan-out is 18
-// discovery configs + 21 state messages.
+// by an MQTT (re)connect or an HA "online" birth message. The fan-out is 32
+// discovery configs + up to 35 state messages.
 const republishTimeout = 10 * time.Second
 
 // App is the wired application root. It owns every long-lived component
@@ -107,7 +113,8 @@ func New(cfg *config.Config, logger *slog.Logger) (*App, error) {
 	poller := service.NewPoller(pollCtrl, nil, pollerCfg, clock, logger)
 	availMgr := service.NewAvailabilityManager(poller, cfg.Polling.AvailabilityThreshold, clock, logger)
 
-	applyCmd := usecase.NewApplyCommand(dispatcher, poller, logger)
+	applyCmd := usecase.NewApplyCommand(dispatcher, poller, logger).
+		WithWriteNotAppliedRecorder(metrics.WriteNotAppliedRecorder{})
 	pubDiscovery := usecase.NewPublishDiscovery(builder, mqttClient, logger)
 	pubState := usecase.NewPublishState(mqttClient, topics, logger)
 
@@ -225,13 +232,15 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}
 
+	cancel()
 	a.shutdown()
 	return runErr
 }
 
 // shutdown drains the HTTP server, cancels the application context (already
-// cancelled if Run is exiting via ctx.Done), waits for the poller and
-// availability manager goroutines to exit within bounded timeouts, then
+// cancelled if Run is exiting via ctx.Done), waits for the poller,
+// availability manager, command worker and any in-flight HA-birth republish
+// to exit within bounded timeouts, then
 // disconnects MQTT (publishes retained offline) and closes the Modbus
 // transport. Errors are logged; shutdown never returns one.
 func (a *App) shutdown() {
@@ -252,6 +261,18 @@ func (a *App) shutdown() {
 	case <-a.availMgr.Done():
 	case <-time.After(availMgrShutdownTimeout):
 		a.logger.Warn("availability manager shutdown timeout")
+	}
+
+	select {
+	case <-a.cmdSub.Done():
+	case <-time.After(mqttWorkersShutdownTimeout):
+		a.logger.Warn("command subscriber shutdown timeout")
+	}
+
+	select {
+	case <-a.haStatus.Idle():
+	case <-time.After(mqttWorkersShutdownTimeout):
+		a.logger.Warn("ha status republish shutdown timeout")
 	}
 
 	a.mqttClient.Disconnect(mqttDisconnectQuiesce)

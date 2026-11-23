@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"sync"
 
+	"github.com/alexmorbo/oasis-modbus2mqtt/domain/catalog"
 	"github.com/alexmorbo/oasis-modbus2mqtt/domain/entity"
 	"github.com/alexmorbo/oasis-modbus2mqtt/domain/valueobject"
 )
@@ -28,16 +30,26 @@ type stateMsg struct {
 	objectID string
 }
 
+// unknownSetting is a settings register whose value has no HA state.
+type unknownSetting struct {
+	objectID string
+	raw      uint16
+}
+
 // PublishState transforms a domain Snapshot into per-entity MQTT state messages
 // and publishes every message retained on every Apply. Idempotent publishes
 // are cheap and let any reconnecting subscriber recover the current value
 // from the broker instead of waiting for the next change. A single Apply call
-// emits up to 21 messages (19 until the best-effort filter registers have
-// been read once); per-topic publish errors are aggregated via errors.Join.
+// emits up to 35 messages: 19 always, plus the filter pair and the 14 panel
+// settings once each best-effort read has succeeded. Per-topic publish errors
+// are aggregated via errors.Join.
 type PublishState struct {
 	publisher Publisher
 	topics    Topics
 	logger    *slog.Logger
+
+	mu            sync.Mutex
+	unknownWarned map[string]uint16
 }
 
 // NewPublishState constructs a PublishState. A nil publisher or nil topics
@@ -54,24 +66,30 @@ func NewPublishState(pub Publisher, topics Topics, logger *slog.Logger) *Publish
 		logger = slog.Default()
 	}
 	return &PublishState{
-		publisher: pub,
-		topics:    topics,
-		logger:    logger,
+		publisher:     pub,
+		topics:        topics,
+		logger:        logger,
+		unknownWarned: make(map[string]uint16),
 	}
 }
 
-// Apply publishes every state message for snap with retained=true. Up to 21
+// Apply publishes every state message for snap with retained=true. Up to 35
 // messages are sent on every call — there is no payload-level dedup. The
 // filter_days_left and filter_resource messages are omitted while
-// snap.FilterPolledAt is zero, so HA keeps them "unknown" instead of
-// recording a bogus 0 before the slow tier has read them. The
+// snap.FilterPolledAt is zero, and the panel settings while
+// snap.SettingsPolledAt is zero, so HA keeps them "unknown" instead of
+// recording a bogus 0 before the slow tier has read them. A setting whose
+// value has no HA state publishes "None" and warns once per distinct value. The
 // retained flag means a late or reconnecting subscriber (HA restart, MQTT
 // integration reload, broker blip) recovers the current value from the
 // broker instead of staying at "unknown" until the underlying register
 // changes. Per-topic publish errors are aggregated via errors.Join; a single
 // failed publish does not skip the remaining topics.
 func (p *PublishState) Apply(ctx context.Context, snap entity.Snapshot) error {
-	msgs := p.buildMessages(snap)
+	msgs, unknown := p.buildMessages(snap)
+	if !snap.SettingsPolledAt.IsZero() {
+		p.warnUnknownSettings(unknown)
+	}
 
 	var (
 		errs      []error
@@ -96,10 +114,32 @@ func (p *PublishState) Apply(ctx context.Context, snap entity.Snapshot) error {
 	return nil
 }
 
-// buildMessages returns the ordered list of state messages for snap (21, or
-// 19 without the filter pair). Pure function: no I/O, no goroutines,
-// deterministic ordering for stable tests.
-func (p *PublishState) buildMessages(snap entity.Snapshot) []stateMsg {
+// warnUnknownSettings logs each unknown setting once per distinct raw value
+// and forgets settings that have become known again.
+func (p *PublishState) warnUnknownSettings(unknown []unknownSetting) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	current := make(map[string]struct{}, len(unknown))
+	for _, u := range unknown {
+		current[u.objectID] = struct{}{}
+		if prev, warned := p.unknownWarned[u.objectID]; warned && prev == u.raw {
+			continue
+		}
+		p.unknownWarned[u.objectID] = u.raw
+		p.logger.Warn("setting value has no label", "object_id", u.objectID, "raw", u.raw)
+	}
+	for id := range p.unknownWarned {
+		if _, still := current[id]; !still {
+			delete(p.unknownWarned, id)
+		}
+	}
+}
+
+// buildMessages returns the ordered list of state messages for snap (19, plus
+// 2 for the filter pair and 14 for the panel settings once each is polled)
+// and the settings whose value has no HA state. Pure function: no I/O, no
+// goroutines, deterministic ordering for stable tests.
+func (p *PublishState) buildMessages(snap entity.Snapshot) ([]stateMsg, []unknownSetting) {
 	msgs := []stateMsg{
 		{
 			topic:    p.topics.State("supply_temperature"),
@@ -161,6 +201,21 @@ func (p *PublishState) buildMessages(snap entity.Snapshot) []stateMsg {
 			},
 		)
 	}
+	var unknown []unknownSetting
+	if !snap.SettingsPolledAt.IsZero() {
+		for _, def := range catalog.Settings {
+			raw, _ := snap.Settings.Register(def.Addr.Uint16())
+			payload, known := def.StatePayload(raw)
+			if !known {
+				unknown = append(unknown, unknownSetting{objectID: def.ObjectID, raw: def.Field(raw)})
+			}
+			msgs = append(msgs, stateMsg{
+				topic:    p.topics.State(def.ObjectID),
+				payload:  []byte(payload),
+				objectID: def.ObjectID,
+			})
+		}
+	}
 	return append(msgs, []stateMsg{
 		{
 			topic:    p.topics.State("operation_time_left"),
@@ -179,7 +234,7 @@ func (p *PublishState) buildMessages(snap entity.Snapshot) []stateMsg {
 		},
 		{
 			topic:    p.topics.State("heater_active"),
-			payload:  []byte(boolToOnOff(snap.HeaterPWM)),
+			payload:  []byte(boolToOnOff(snap.HeaterActive())),
 			objectID: "heater_active",
 		},
 		{
@@ -212,7 +267,7 @@ func (p *PublishState) buildMessages(snap entity.Snapshot) []stateMsg {
 			payload:  []byte(hvacAction(snap)),
 			objectID: "hvac_action",
 		},
-	}...)
+	}...), unknown
 }
 
 // formatTemperature renders t with exactly one decimal place. A zero-value
@@ -254,8 +309,9 @@ func hvacMode(snap entity.Snapshot) string {
 }
 
 // hvacAction maps the snapshot to HA's hvac_action vocabulary. Priority order
-// (top wins): power off → preheat transition → fan transitions → heater PWM
-// active → fan running → idle. Matches plan section 6.
+// (top wins): power off → preheat transition → fan transitions → idle
+// transitions → heat demand → fan running → idle. Heat demand is
+// Snapshot.HeaterActive, not the ~1 Hz heater PWM, so "heating" is stable.
 func hvacAction(snap entity.Snapshot) string {
 	if !snap.PowerOn {
 		return "off"
@@ -271,7 +327,7 @@ func hvacAction(snap entity.Snapshot) string {
 		entity.OpOpenColdValve, entity.OpCloseColdValve:
 		return "idle"
 	}
-	if snap.HeaterPWM {
+	if snap.HeaterActive() {
 		return "heating"
 	}
 	if snap.FanState1 > 0 {

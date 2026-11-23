@@ -106,3 +106,24 @@ func TestSnapshot_DecodeErrorSet(t *testing.T) {
 		assert.True(t, s.DecodeErrorSet().IsEmpty())
 	})
 }
+
+func TestSnapshot_HeaterActive(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		snap entity.Snapshot
+		want bool
+	}{
+		{name: "power off with demand", snap: entity.Snapshot{PowerOn: false, PIDDemand: 42, HeaterPWM: true}, want: false},
+		{name: "power on, no demand, PWM on", snap: entity.Snapshot{PowerOn: true, PIDDemand: 0, HeaterPWM: true}, want: false},
+		{name: "power on, demand, PWM on", snap: entity.Snapshot{PowerOn: true, PIDDemand: 42, HeaterPWM: true}, want: true},
+		{name: "power on, demand, PWM off", snap: entity.Snapshot{PowerOn: true, PIDDemand: 42, HeaterPWM: false}, want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, tc.snap.HeaterActive())
+		})
+	}
+}
