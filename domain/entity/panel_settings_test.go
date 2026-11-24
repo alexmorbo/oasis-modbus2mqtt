@@ -12,10 +12,12 @@ func TestPanelSettings_RegisterRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	var s entity.PanelSettings
-	addrs := []uint16{22, 23, 24, 25, 35, 36}
-	for i, addr := range addrs {
-		next, ok := s.WithRegister(addr, uint16(100+i))
-		assert.Truef(t, ok, "h%d", addr)
+	regs := []struct{ addr, val uint16 }{
+		{22, 100}, {23, 101}, {24, 102}, {25, 103}, {35, 104}, {36, 105},
+	}
+	for _, r := range regs {
+		next, ok := s.WithRegister(r.addr, r.val)
+		assert.Truef(t, ok, "h%d", r.addr)
 		s = next
 	}
 	want := entity.PanelSettings{
@@ -23,10 +25,10 @@ func TestPanelSettings_RegisterRoundTrip(t *testing.T) {
 		UserDev0: 103, HumidityTarget: 104, CO2Target: 105,
 	}
 	assert.Equal(t, want, s)
-	for i, addr := range addrs {
-		got, ok := s.Register(addr)
-		assert.Truef(t, ok, "h%d", addr)
-		assert.Equal(t, uint16(100+i), got)
+	for _, r := range regs {
+		got, ok := s.Register(r.addr)
+		assert.Truef(t, ok, "h%d", r.addr)
+		assert.Equal(t, r.val, got)
 	}
 
 	for _, addr := range []uint16{0, 21, 26, 34, 37, 86} {
