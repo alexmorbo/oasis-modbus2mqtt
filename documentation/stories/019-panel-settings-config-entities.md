@@ -1,6 +1,9 @@
 ---
 title: "Feature: Panel settings as HA config entities, default_entity_id, stable heater_active"
-status: review
+status: shipped
+commit_sha: 254888e (+ 57caff7 lint fix)
+release: v0.1.3
+deployed: 2026-11-24 (delta, terragrunt oasis-mqtt-bridge)
 priority: high
 complexity: 8
 created: 2026-11-23
@@ -699,3 +702,14 @@ The six LOW findings were accepted as follow-ups and not fixed:
   download step is gated on `go.sum` existing, so it never runs and modules download inside the `go build` layer on
   every source change. `COPY go.mod go.sum ./` would make the module cache layer effective. Not changed.
 - `PublishState` still publishes all retained state on every tier poll. With 35 messages per 5 s on a local broker this is fine. No dedupe added.
+
+## Live verification (2026-11-24, delta, v0.1.3)
+
+- CI on 254888e was red: Lint failed on gosec G115 in `domain/entity/panel_settings_test.go`, because CI pins golangci-lint v2.5.0 and the local run used v2.12. Fixed in 57caff7, and `make lint` now pins v2.5.0. CI is green on 57caff7 and on tag v0.1.3.
+- Startup log: `version: v0.1.3`, `discovery published count=32`, all 18 command topics subscribed, no WARN/ERROR.
+- HA: all 14 config entities were created with the expected `default_entity_id` names (no `koridor_` area prefix). Their states matched the live registers and the physical panel (h22 0x07E4, h25 bit2=1, priority temperature, 50 / 500 / 20).
+- `switch.oasis_syberia_active_filter` off: the bridge logged `setting applied value=0`, and a direct register dump confirmed h25 0x0004 → 0x0000. No write-not-applied.
+- heater_active / hvac_action: steady for 4+ minutes with heat demand 44. Before the fix it flipped every ~5 s.
+- Pending, needs the operator at the panel: alarm_beep toggle confirmed on the panel, control_priority code for "pressure", and the h86 mode off→heat round trip.
+- Follow-ups: the `MODBUS_HOST` default points at the production controller (a test container hit it during impl; connection refused); climate `name: null`; read-back for h31/h32/h86; Dockerfile module cache.
+
